@@ -1,0 +1,89 @@
+# vllm-v100: V100 (SM70) inference image
+#
+# Installs 1Cat's pre-built wheel (for compiled TurboMind SM70 CUDA kernels),
+# then overlays patched Python files for compressed-tensors, MoE, and
+# TurboMindLinearKernel support.
+#
+# Build:
+#   docker build -f docker/Dockerfile.v100 -t vllm-v100:latest .
+#
+# The build context must be the repo root so COPY can reach vllm/ source files.
+
+FROM python:3.12-slim-trixie
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/root/.cache/huggingface \
+    VLLM_NO_USAGE_STATS=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        gcc \
+        g++ \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TORCH_VERSION=2.9.1
+ARG TORCHVISION_VERSION=0.24.1
+ARG TORCHAUDIO_VERSION=2.9.1
+ARG VLLM_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.2/vllm-0.0.2.dev0+g55573923a.d20260321.cu128-cp312-cp312-linux_x86_64.whl"
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+    && python -m pip install "${VLLM_WHEEL_URL}"
+
+# ---------- Overlay patched Python files onto installed wheel ----------
+# The wheel provides compiled CUDA kernels (awq_gemm_sm70, etc.).
+# These COPY commands replace only the Python files we've patched.
+
+ARG SITE_PKG=/usr/local/lib/python3.12/site-packages/vllm
+
+# 1. compressed-tensors min_capability 75 → 70
+COPY vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py \
+     ${SITE_PKG}/model_executor/layers/quantization/compressed_tensors/schemes/
+
+# 2. Triton W4A16 kernel (PR #32597, fallback for dense layers)
+COPY vllm/model_executor/layers/quantization/gptq_triton.py \
+     ${SITE_PKG}/model_executor/layers/quantization/
+
+# 3. TritonLinearKernel wrapper
+COPY vllm/model_executor/layers/quantization/kernels/mixed_precision/triton.py \
+     ${SITE_PKG}/model_executor/layers/quantization/kernels/mixed_precision/
+
+# 4. TurboMindLinearKernel — CT→AWQ→TurboMind for dense layers (<0.1% error)
+COPY vllm/model_executor/layers/quantization/kernels/mixed_precision/turbomind.py \
+     ${SITE_PKG}/model_executor/layers/quantization/kernels/mixed_precision/
+
+# 5. Kernel registration (TurboMind priority, Triton fallback)
+COPY vllm/model_executor/layers/quantization/kernels/mixed_precision/__init__.py \
+     ${SITE_PKG}/model_executor/layers/quantization/kernels/mixed_precision/
+
+# 6. _DEFAULT_MAX_TOKENS alias fix
+COPY vllm/model_executor/layers/quantization/awq_sm70_moe.py \
+     ${SITE_PKG}/model_executor/layers/quantization/
+
+# 7. CT MoE delegates to AWQSM70MoEMethod
+COPY vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py \
+     ${SITE_PKG}/model_executor/layers/quantization/compressed_tensors/
+
+# ------------------------------------------------------------------
+
+COPY docker/entrypoint.sm70.sh /usr/local/bin/entrypoint.sm70.sh
+RUN chmod +x /usr/local/bin/entrypoint.sm70.sh
+
+WORKDIR /workspace
+EXPOSE 8000
+
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sm70.sh"]
+CMD []
