@@ -29,6 +29,9 @@ logger = init_logger(__name__)
 # permanently reserve hundreds of MiB per layer.
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 
+# Alias: compressed_tensors_moe.py imports this name
+_DEFAULT_MAX_TOKENS = _DEFAULT_PERSISTENT_MAX_TOKENS
+
 
 def _single_token_compact_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_AWQ_ENABLE_SINGLE_TOKEN_COMPACT")
