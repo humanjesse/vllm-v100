@@ -199,7 +199,8 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 sm70_ok = (
                     gs in (32, 64, 128)
                     and hidden % gs == 0
-                    and inter % gs == 0
+                    # inter % gs is NOT required: AWQ SM70 pads
+                    # intermediate to group_size boundaries internally
                     and hidden % 8 == 0
                     and inter % 8 == 0
                     and weight_quant.symmetric
