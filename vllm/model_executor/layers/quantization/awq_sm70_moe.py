@@ -483,6 +483,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
         """MoE forward: batched GEMM (preferred) or sorted-loop fallback."""
+        # Under Expert Parallelism, topk_ids are global (0..global_num_experts-1)
+        # but our layer only owns layer.sm70_num_experts local experts. Zero the
+        # topk_weights for non-local experts so their contribution is zero after
+        # unpermute, regardless of how the kernel handles invalid rows.
+        expert_map = getattr(layer, "expert_map", None)
+        if expert_map is not None:
+            local_ids = expert_map[topk_ids]
+            valid_mask = (local_ids >= 0).to(topk_weights.dtype)
+            topk_weights = topk_weights * valid_mask
+
         if (
             getattr(layer, "sm70_batched_ready", False)
             and x.shape[0] == 1
@@ -583,8 +593,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         num_experts: int,
         buffers: dict[str, torch.Tensor],
+        expert_map: torch.Tensor | None = None,
+        global_num_experts: int | None = None,
     ):
-        """Permute tokens by expert using the native MoE CUDA kernels."""
+        """Permute tokens by expert using the native MoE CUDA kernels.
+
+        Under EP, pass expert_map (global->local translation tensor) and
+        global_num_experts. The kernel writes -1 to m_indices for tokens
+        routed to non-local experts and limits valid rows to
+        expert_first_token_offset[:n_local_expert+1].
+        """
         num_tokens = x.shape[0]
         top_k = topk_ids.shape[1]
 
@@ -596,13 +614,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         topk_ids_i32 = buffers["topk_ids_i32"]
         token_expert_indices = buffers["token_expert_indices"]
 
+        n_global = (global_num_experts if global_num_experts is not None
+                    else num_experts)
+
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
         torch.ops._moe_C.moe_permute(
             x,
             topk_ids_i32,
             token_expert_indices,
-            None,
-            num_experts,
+            expert_map,
+            n_global,
             num_experts,
             top_k,
             None,
@@ -634,12 +655,23 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if total_slots == 0:
             return output
 
+        expert_map = getattr(layer, "expert_map", None)
+        global_num_experts = getattr(layer, "global_num_experts", num_experts)
+
         (permuted_input, expert_offsets64,
          inv_permuted_idx) = self._permute_tokens_by_expert(
-            layer, x, topk_ids, num_experts, buffers)
+            layer, x, topk_ids, num_experts, buffers,
+            expert_map=expert_map,
+            global_num_experts=global_num_experts)
         expert_offsets = buffers["expert_offsets"]
         intermediate = buffers["intermediate"]
         sorted_output = buffers["sorted_output"]
+        # Under EP, some rows in sorted_output correspond to non-local tokens
+        # that the GEMM leaves uninitialized. Zero-fill so unpermute reads
+        # deterministic values (topk_weights for those tokens are already 0
+        # from apply(), but defense in depth).
+        if expert_map is not None:
+            sorted_output.zero_()
 
         # Batched w13 GEMM (gate+up for gated, up for non-gated).
         ops.awq_moe_gemm_sm70_out(
@@ -692,6 +724,17 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         output.zero_()
         if total_slots == 0:
             return output
+
+        # Under EP, translate global topk_ids to local and zero weights for
+        # non-local experts. Non-local tokens are clamped to local expert 0
+        # for indexing safety — their contribution is zero via weights, so
+        # correctness holds (at some compute cost, but this path is a fallback).
+        expert_map = getattr(layer, "expert_map", None)
+        if expert_map is not None:
+            local_ids = expert_map[topk_ids]
+            valid_mask = local_ids >= 0
+            topk_weights = topk_weights * valid_mask.to(topk_weights.dtype)
+            topk_ids = local_ids.clamp(min=0).to(topk_ids.dtype)
 
         flat_ids = topk_ids.view(-1)
         flat_weights = topk_weights.view(-1)
