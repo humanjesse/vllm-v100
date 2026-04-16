@@ -222,6 +222,7 @@ def _warmup_moe_layers(
                 device=device,
             )
 
+            gated = getattr(layer, "sm70_gated", True)
             ops.awq_moe_gemm_sm70_out(
                 intermediate,
                 permuted_input,
@@ -232,7 +233,7 @@ def _warmup_moe_layers(
                 int(layer.sm70_w13_k_dim),
                 int(layer.sm70_w13_n_dim),
                 group_size,
-                True,
+                gated,
             )
             ops.awq_moe_gemm_sm70_out(
                 sorted_output,

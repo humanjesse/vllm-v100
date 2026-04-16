@@ -562,6 +562,20 @@ def _chunk_state_fwd(
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
+
+    import os
+    if os.environ.get("VLLM_SSD_DEBUG"):
+        import torch
+        free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+        total_mem = torch.cuda.mem_get_info()[1] / 1024**3
+        print(f"[SSD_DEBUG] _chunk_state_fwd: seqlen={seqlen} nheads={nheads} "
+              f"headdim={headdim} nchunks={nchunks} chunk_size={chunk_size} "
+              f"ngroups={ngroups} dstate={dstate} "
+              f"nheads_ngroups_ratio={nheads // ngroups} "
+              f"GPU_free={free_mem:.2f}GiB/{total_mem:.2f}GiB "
+              f"states_shape=({nchunks},{nheads},{headdim},{dstate})",
+              flush=True)
+
     assert nheads % ngroups == 0
     assert B.shape == (seqlen, ngroups, dstate)
     assert dt.shape == (nheads, nchunks, chunk_size)

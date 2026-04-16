@@ -131,6 +131,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         self.group_size = group_size
         self.zero_point = zero_point
         self.pack_factor = 32 // weight_bits  # 8
+        # Gated MoE (e.g. MiniMax, Mixtral) fuses gate+up into w13 with SiLU.
+        # Non-gated MoE (e.g. NemotronH) has a single up projection + ReLU².
+        self.gated = moe.is_act_and_mul
 
     def create_weights(
         self,
@@ -149,9 +152,13 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
         extra_weight_attrs.pop("intermediate_size_full", None)
 
+        # Gated MoE: w13 = [gate, up] → 2*intermediate. Non-gated: just up.
+        w13_out = (2 * intermediate_size_per_partition
+                   if self.gated else intermediate_size_per_partition)
+
         w13_qweight = Parameter(
             torch.empty(num_experts, hidden_size,
-                        2 * intermediate_size_per_partition // self.pack_factor,
+                        w13_out // self.pack_factor,
                         dtype=torch.int32),
             requires_grad=False,
         )
@@ -171,7 +178,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
 
         w13_scales = Parameter(
             torch.empty(num_experts, num_groups_w13,
-                        intermediate_size_per_partition * 2, dtype=params_dtype),
+                        w13_out, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w13_scales", w13_scales)
@@ -187,7 +194,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
 
         w13_qzeros = Parameter(
             torch.empty(num_experts, num_groups_w13,
-                        2 * intermediate_size_per_partition // self.pack_factor,
+                        w13_out // self.pack_factor,
                         dtype=torch.int32),
             requires_grad=False,
         )
@@ -207,38 +214,34 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         align = self.group_size
         hidden_logical_size = int(layer.w13_qweight.shape[1])
         w13_logical_out = int(layer.w13_scales.shape[-1])
-        intermediate_logical_size = w13_logical_out // 2
+        # Gated MoE: w13 = [gate, up] → 2*intermediate, so /2.
+        # Non-gated: w13 = [up] → intermediate directly.
+        intermediate_logical_size = (w13_logical_out // 2
+                                     if self.gated else w13_logical_out)
         w2_logical_out = int(layer.w2_scales.shape[-1])
 
-        layer.w13_qweight, layer.w13_scales, layer.w13_qzeros, w13_aligned_out = (
-            _align_awq_output_dim(
-                layer.w13_qweight,
-                layer.w13_scales,
-                layer.w13_qzeros,
-                self.pack_factor,
-                align * 2,
-            )
-        )
-        aligned_intermediate_size = w13_aligned_out // 2
+        # Unpack to locals then assign as Parameter so this works both when
+        # layer attrs are plain tensors (direct AWQ) or nn.Parameter
+        # (CT→AWQ delegation path, e.g. NemotronH).
+        # Gated: align to group_size*2 (gate+up pair). Non-gated: group_size.
+        w13_align = align * 2 if self.gated else align
+        _qw, _sc, _qz, w13_aligned_out = _align_awq_output_dim(
+            layer.w13_qweight, layer.w13_scales, layer.w13_qzeros,
+            self.pack_factor, w13_align)
+        layer.w13_qweight = Parameter(_qw, requires_grad=False)
+        layer.w13_scales = Parameter(_sc, requires_grad=False)
+        layer.w13_qzeros = Parameter(_qz, requires_grad=False)
+        aligned_intermediate_size = (w13_aligned_out // 2
+                                     if self.gated else w13_aligned_out)
 
-        layer.w2_qweight, layer.w2_scales, layer.w2_qzeros, _ = (
-            _align_awq_input_dim(
-                layer.w2_qweight,
-                layer.w2_scales,
-                layer.w2_qzeros,
-                self.group_size,
-                align,
-            )
-        )
-        layer.w2_qweight, layer.w2_scales, layer.w2_qzeros, hidden_aligned_size = (
-            _align_awq_output_dim(
-                layer.w2_qweight,
-                layer.w2_scales,
-                layer.w2_qzeros,
-                self.pack_factor,
-                align,
-            )
-        )
+        _qw, _sc, _qz, _ = _align_awq_input_dim(
+            layer.w2_qweight, layer.w2_scales, layer.w2_qzeros,
+            self.group_size, align)
+        _qw, _sc, _qz, hidden_aligned_size = _align_awq_output_dim(
+            _qw, _sc, _qz, self.pack_factor, align)
+        layer.w2_qweight = Parameter(_qw, requires_grad=False)
+        layer.w2_scales = Parameter(_sc, requires_grad=False)
+        layer.w2_qzeros = Parameter(_qz, requires_grad=False)
 
         layer.sm70_hidden_logical_size = hidden_logical_size
         layer.sm70_hidden_aligned_size = hidden_aligned_size
@@ -269,7 +272,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             r13 = ops.awq_sm70_prepare(
                 layer.w13_qweight[e], layer.w13_scales[e],
                 layer.w13_qzeros[e], self.group_size,
-                interleave_gated_silu=True)
+                interleave_gated_silu=self.gated)
             w13_tm_weights.append(r13[0])
             w13_tm_scales.append(r13[1])
             w13_meta.append(r13[2])
@@ -300,6 +303,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             for i in range(num_experts)
         ]
         layer.sm70_num_experts = num_experts
+        layer.sm70_gated = self.gated
 
         # Dimensions for batched GEMM
         layer.sm70_w13_k_dim = layer.w13_tm_weight.shape[1]
@@ -482,6 +486,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if (
             getattr(layer, "sm70_batched_ready", False)
             and x.shape[0] == 1
+            and self.gated  # compact kernel hardcodes gated SiLU
             and _single_token_compact_enabled()
         ):
             if _single_token_compact_compare_enabled():
@@ -636,15 +641,19 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         intermediate = buffers["intermediate"]
         sorted_output = buffers["sorted_output"]
 
-        # Batched w13 GEMM (gate+up) — write into a pre-allocated buffer.
+        # Batched w13 GEMM (gate+up for gated, up for non-gated).
         ops.awq_moe_gemm_sm70_out(
             intermediate,
             permuted_input, expert_offsets,
             layer.w13_strided_ptrs_w, layer.w13_strided_ptrs_s,
             num_experts, layer.sm70_w13_k_dim,
             layer.sm70_w13_n_dim, self.group_size,
-            True,
+            self.gated,
         )
+        # Non-gated: apply ReLU² activation after w13 GEMM (gated SiLU is
+        # fused inside the kernel when self.gated=True).
+        if not self.gated:
+            intermediate.relu_().square_()
 
         # Batched w2 GEMM (down projection) — write into a pre-allocated buffer.
         ops.awq_moe_gemm_sm70_out(
@@ -730,8 +739,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 self.group_size,
                 w13_k_ld,
                 w13_q_ld,
-                True,
+                self.gated,
             )
+            if not self.gated:
+                intermediate.relu_().square_()
 
             w2_k_ld, w2_q_ld = layer.w2_meta_list[e]
             expert_output = ops.awq_gemm_sm70(
