@@ -77,6 +77,16 @@ COPY vllm/model_executor/layers/quantization/awq_sm70_moe.py \
 COPY vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py \
      ${SITE_PKG}/model_executor/layers/quantization/compressed_tensors/
 
+# 8. Triton SSD single-config (SM70 96KB shared memory limit)
+COPY vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py \
+     ${SITE_PKG}/model_executor/layers/mamba/ops/
+COPY vllm/model_executor/layers/mamba/ops/ssd_chunk_state.py \
+     ${SITE_PKG}/model_executor/layers/mamba/ops/
+
+# 9. Fused MoE config for NemotronH dims on V100 (E=512, N=336)
+COPY "vllm/model_executor/layers/fused_moe/configs/E=512,N=336,device_name=Tesla_V100-SXM2-32GB,dtype=int4_w4a16.json" \
+     ${SITE_PKG}/model_executor/layers/fused_moe/configs/
+
 # ------------------------------------------------------------------
 
 COPY docker/entrypoint.sm70.sh /usr/local/bin/entrypoint.sm70.sh
