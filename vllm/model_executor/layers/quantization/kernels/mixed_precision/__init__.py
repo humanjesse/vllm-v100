@@ -36,6 +36,9 @@ from vllm.model_executor.layers.quantization.kernels.mixed_precision.triton impo
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.turbomind import (  # noqa: E501
     TurboMindLinearKernel,
 )
+from vllm.model_executor.layers.quantization.kernels.mixed_precision.turbomind_asym import (  # noqa: E501
+    TurboMindAsymLinearKernel,
+)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.xpu import (  # noqa: E501
     XPUwNa16LinearKernel,
 )
@@ -50,6 +53,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         MarlinLinearKernel,
         ConchLinearKernel,
         TurboMindLinearKernel,
+        TurboMindAsymLinearKernel,
         TritonLinearKernel,
         ExllamaLinearKernel,
     ],
