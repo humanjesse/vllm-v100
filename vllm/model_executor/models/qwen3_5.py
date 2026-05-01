@@ -110,12 +110,16 @@ logger = init_logger(__name__)
 def _should_split_linear_attn_ba(
     quant_config: QuantizationConfig | None,
 ) -> bool:
-    modules_to_not_convert = (
-        getattr(quant_config, "modules_to_not_convert", None) or []
-    )
+    # AWQ/GPTQ-style configs surface the ignore list as
+    # `modules_to_not_convert`; compressed-tensors uses `ignore`.
+    # Inspect both so the split also triggers for CT-quantized hybrids
+    # where in_proj_a/b are kept in fp16.
+    candidates: list[str] = []
+    candidates.extend(getattr(quant_config, "modules_to_not_convert", None) or [])
+    candidates.extend(getattr(quant_config, "ignore", None) or [])
     return any("linear_attn.in_proj_b" in module
                or "linear_attn.in_proj_a" in module
-               for module in modules_to_not_convert)
+               for module in candidates)
 
 
 def _get_qwen35_linear_attn_packed_modules_mapping(
