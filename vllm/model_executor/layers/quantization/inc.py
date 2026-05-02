@@ -397,8 +397,24 @@ class INCConfig(QuantizationConfig):
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
                 return GPTQMarlinLinearMethod(quant_args_marlin)
-            else:
-                return GPTQLinearMethod(quant_args)
+            # SM70 path: route through TurboMind awq_gemm_sm70 instead of the
+            # buggy gptq_gemm Triton kernel. Falls through if not applicable.
+            from vllm.model_executor.layers.quantization.gptq_turbomind_sm70 import (
+                GPTQTurboMindLinearMethod,
+            )
+
+            ok, reason = GPTQTurboMindLinearMethod.applies_to(quant_args)
+            if ok:
+                logger.info_once(
+                    "[INC/SM70] Routing GPTQ layers through "
+                    "GPTQTurboMindLinearMethod (awq_gemm_sm70)."
+                )
+                return GPTQTurboMindLinearMethod(quant_args)
+            logger.debug(
+                "[INC/SM70] GPTQTurboMind not applicable for %s: %s",
+                prefix, reason,
+            )
+            return GPTQLinearMethod(quant_args)
 
         return None
 
