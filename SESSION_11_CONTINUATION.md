@@ -38,8 +38,12 @@ the cost of rewiring V4Attention to read `attn_metadata` via
 a 4-line change. The metadata path is a clean follow-up if/when we need
 true zero-sync (e.g. for cudagraph capture or async dispatch).
 
-**Quality validation** — `tests/models/test_deepseek_v4_v100_tp8_long_chat.py`,
-73-token chat poem prompt, max=400, stop on EOS:
+**Quality validation** — long_chat poem (TP=8 chat decode) +
+bisect (4 prompts × 32 greedy tokens, exercises the matrix that
+originally caught Bug B in session 10):
+
+`tests/models/test_deepseek_v4_v100_tp8_long_chat.py` (73-token chat
+poem, max=400, stop on EOS):
 
 | run | tokens | finish | bos | tok/s |
 |-----|--------|--------|-----|-------|
@@ -47,11 +51,25 @@ true zero-sync (e.g. for cudagraph capture or async dispatch).
 | post-fix run 1 | 108 | stop | 0/108 | 4.58 |
 | post-fix run 2 | 146 | stop | 0/146 | 4.80 |
 
-The 108-token runs produced **bit-identical poem text** before vs after
-the change (RNG-seeded sampling, deterministic for matched lengths).
-Different decode lengths between runs come from process-startup RNG
-state, not the model change. Like-for-like throughput delta is **+1.6%**
-on matched 108-token decode.
+`tests/models/test_deepseek_v4_v100_tp8_bisect.py` (4 prompts, greedy
+32-tok decode, post-fix):
+
+| prompt | tokens | bos | output preview |
+|--------|--------|-----|----------------|
+| raw_4tok  | 32 | 0/32 | "! I'm here to help you with your request..." |
+| raw_18tok | 32 | 0/32 | " the 1940s. The first counting device was the abacus..." |
+| raw_64tok | 32 | 0/32 | " to perform addition, subtraction, multiplication..." |
+| spec_only | 10 | 0/10 | "Hello! How can I help you today?<EOS>" |
+
+These four bisect outputs are bit-identical to the session-10
+post-clamp-fix table — confirms the host-sync drop is semantically
+inert across the prompt-shape matrix that originally caught Bug B.
+
+The 108-token long_chat runs produced **bit-identical poem text**
+before vs after the change (RNG-seeded sampling, deterministic for
+matched lengths). Different decode lengths between runs come from
+process-startup RNG state, not the model change. Like-for-like
+throughput delta is **+1.6%** on matched 108-token decode.
 
 This is far below the prompt's 10-20% prediction. The reason: under
 `enforce_eager` with synchronous dispatch, each `.item()` is dominated
