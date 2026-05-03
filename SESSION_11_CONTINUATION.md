@@ -65,6 +65,14 @@ These four bisect outputs are bit-identical to the session-10
 post-clamp-fix table — confirms the host-sync drop is semantically
 inert across the prompt-shape matrix that originally caught Bug B.
 
+`tests/models/test_deepseek_v4_v100_forward_smoke.py` (TP=1 synthetic
+4-layer config, 64-token prefill + 1-token decode + compute_logits):
+**ALL PASS**, prefill abs.mean=0.8013/max=3.4121 (finite=True), decode
+abs.mean=0.7998, logits abs.mean=0.1713 — numbers match the session-7
+baseline. Confirms the host-sync drop works at TP=1 (the only
+V4Attention.forward path the TP=8 long_chat / bisect / PPL tests don't
+exercise).
+
 The 108-token long_chat runs produced **bit-identical poem text**
 before vs after the change (RNG-seeded sampling, deterministic for
 matched lengths). Different decode lengths between runs come from
