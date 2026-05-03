@@ -729,6 +729,7 @@ class V4Attention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        start_pos: int,
     ) -> torch.Tensor:
         """Single-request V4-Flash attention forward.
 
@@ -747,6 +748,10 @@ class V4Attention(nn.Module, AttentionLayerBase):
         Inputs follow vLLM v1's flat shape:
           positions     [num_tokens]
           hidden_states [num_tokens, hidden_size]
+          start_pos     scalar int — first position in this request's
+                        slice. Computed once at ``DeepseekV4Model.forward``
+                        from ``positions[0]`` and threaded down to avoid
+                        43 per-layer host syncs.
 
         Returns [num_tokens, hidden_size].
         """
@@ -767,12 +772,6 @@ class V4Attention(nn.Module, AttentionLayerBase):
             "require lifting the windowed KV into vLLM's paged cache."
         )
 
-        # Determine start_pos from the first token's position. Triggers a
-        # host sync but tolerable under --enforce-eager.
-        if positions.dim() == 1:
-            start_pos = int(positions[0].item())
-        else:
-            start_pos = int(positions[0, 0].item())
         if start_pos > 0:
             assert seqlen == 1, (
                 "V4Attention decode branch (start_pos>0) requires "
@@ -1048,11 +1047,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
+        start_pos: int,
     ) -> torch.Tensor:
         """One transformer block. Mirrors reference Block.forward.
 
         x: [bsz, num_tokens, hc_mult, hidden_size]  (HC-expanded hidden).
         Returns the same shape (HC-expanded).
+
+        ``start_pos`` is derived once per ``DeepseekV4Model.forward`` from
+        ``positions[0]`` and threaded through the layer stack so each layer
+        avoids the per-layer host sync that ``int(positions[0].item())``
+        would otherwise force.
         """
         # ATTN sub-block: hc_pre → attn_norm → V4Attention → hc_post.
         residual = x
@@ -1072,7 +1077,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # batch dim so the attn forward's own ``squeeze`` path triggers
         # consistently.
         attn_in = x_pre.squeeze(0) if x_pre.dim() == 3 else x_pre
-        attn_out = self.attn(positions, attn_in)
+        attn_out = self.attn(positions, attn_in, start_pos=start_pos)
         if attn_out.dim() == 2:
             attn_out = attn_out.unsqueeze(0)
         x = _hc_post(attn_out, residual, post, comb)
@@ -1189,8 +1194,19 @@ class DeepseekV4Model(nn.Module):
         h = h.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
         # h is now [1, num_tokens, hc_mult, hidden_size]
 
+        # Derive start_pos once for the whole layer stack (rather than
+        # per-layer inside V4Attention.forward, which would cost a CPU-GPU
+        # sync per layer × 43 layers per forward). For the bsz=1 single-
+        # request contract that V4Attention.forward asserts, the first
+        # token's position is the start of this scheduling step's slice.
+        # One host sync per forward instead of 43.
+        if positions.dim() == 1:
+            start_pos = int(positions[0].item())
+        else:
+            start_pos = int(positions[0, 0].item())
+
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            h = layer(h, positions, input_ids)
+            h = layer(h, positions, input_ids, start_pos)
 
         # Reduce HC copies via the model-level hc_head params, then norm.
         h = _hc_head(
