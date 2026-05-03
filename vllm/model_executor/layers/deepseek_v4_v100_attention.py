@@ -212,11 +212,16 @@ class V4Compressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         )
-        # In the checkpoint wkv/wgate are bf16 weights; we cast to fp16 at
-        # load time. The reference keeps these in fp32 for "convenience";
-        # we follow suit since the gemms are tiny.
-        self.wkv = nn.Linear(self.dim, coff * self.head_dim, bias=False)
-        self.wgate = nn.Linear(self.dim, coff * self.head_dim, bias=False)
+        # Compressor weights stay fp32: the reference's Compressor.forward
+        # casts x to fp32 before wkv/wgate, so these linears must accept
+        # fp32 inputs. Set dtype explicitly so this is independent of
+        # torch.get_default_dtype() at construction time.
+        self.wkv = nn.Linear(
+            self.dim, coff * self.head_dim, bias=False, dtype=torch.float32
+        )
+        self.wgate = nn.Linear(
+            self.dim, coff * self.head_dim, bias=False, dtype=torch.float32
+        )
         self.norm = V4RMSNorm(self.head_dim, args.norm_eps)
 
         # Lazily-bound buffers (set by the parent Attention/Indexer):
