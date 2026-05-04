@@ -261,20 +261,7 @@ class V4Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        start_pos_tensor: torch.Tensor | None = None,
-    ):
-        """V4 compressor forward.
-
-        ``start_pos`` (Python int) is used for capture-time decisions (the
-        prefill ``start_pos == 0`` branch, host-side ``self.freqs_cis``
-        slicing). ``start_pos_tensor`` is the [1]-long device buffer mirror
-        used in the decode-path tensor arithmetic — Stage-3 cudagraph
-        rewrite. Decode path requires it; prefill ignores it.
-        """
+    def forward(self, x: torch.Tensor, start_pos: int):
         assert self.kv_cache is not None, "kv_cache must be bound before forward"
         bsz, seqlen, _ = x.size()
         ratio = self.compress_ratio
@@ -312,137 +299,56 @@ class V4Compressor(nn.Module):
                 kv = self.overlap_transform(kv, 0)
                 score = self.overlap_transform(score, float("-inf"))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
-
-            if not should_compress:
-                return None
-            kv = self.norm(kv.to(out_dtype))
-            freqs_cis = self.freqs_cis[:cutoff:ratio]
-            apply_rotary_emb(kv[..., -rd:], freqs_cis)
-            self.kv_cache[:bsz, : seqlen // ratio] = kv
-            return kv
-
-        # Decode path (start_pos > 0). Stage-3 cudagraph rewrite: every
-        # capture-blocking host-int op below is replaced with a tensor-shape
-        # equivalent that reads from ``start_pos_tensor`` at replay time.
-        #
-        #   * Slot indices for ``kv_state`` / ``score_state`` writes:
-        #     (start_pos % ratio) becomes a [1]-long tensor; the writes go
-        #     through ``index_copy_`` instead of Python-int slice assignment.
-        #   * APE additive offset: ``self.ape[start_pos % ratio]`` becomes
-        #     ``index_select`` so the row pointer is computed in-graph.
-        #   * ``should_compress`` Python bool becomes a [1]-bool tensor; the
-        #     compressed-kv computation runs every step (cheap), but the
-        #     final write to ``self.kv_cache`` is masked via ``where`` so
-        #     non-compress steps preserve the slot's previous value.
-        #   * The post-compress shift (``kv_state[:ratio] = kv_state[ratio:]``
-        #     and same for ``score_state``) becomes a where-masked update on
-        #     the same slice — cheap fixed-shape op (~256 KB per layer).
-        #
-        # Result: same numerical behavior in eager mode, every op is a
-        # capturable kernel launch with no Python branching on per-step
-        # values.
-        if start_pos_tensor is None:
-            # Test/standalone path (e.g.
-            # tests/kernels/attention/test_deepseek_v4_v100_attention.py
-            # which calls this directly without the V4 backend metadata
-            # builder). One-time host→device tensor build per call —
-            # NOT cudagraph-friendly, so the production V4Attention call
-            # site always provides the persistent buffer (see
-            # ``DeepSeekV4FlashV100MetadataBuilder._start_pos_buf``).
-            start_pos_tensor = torch.tensor(
-                [start_pos], dtype=torch.long, device=x.device
-            )
-
-        # Slot index tensors: [1]-long, all derived from start_pos_tensor.
-        slot_t = (start_pos_tensor % ratio).long()  # [1] in [0, ratio)
-        # ``ape_row``: ape row to add to ``score`` (replaces ``self.ape[idx]``).
-        ape_row = self.ape.index_select(0, slot_t)  # [1, coff*d]
-        score = score + ape_row  # broadcast over (bsz=1, seqlen=1, coff*d)
-        # ``should_compress_t``: [1] bool, true iff (start_pos+1) % ratio == 0.
-        should_compress_t = ((start_pos_tensor + 1) % ratio) == 0
-
-        if overlap:
-            slot_offset_t = ratio + slot_t  # [1] in [ratio, 2*ratio)
-            # ``kv`` shape: (bsz, seqlen=1, coff*d). ``index_copy_(dim=1, ...)``
-            # source must match self in all dims except dim=1, which becomes
-            # ``len(index) = 1``. Operating on the ``[:bsz]`` view keeps dim 0
-            # at bsz=1; in-place writes propagate to the underlying storage.
-            self.kv_state[:bsz].index_copy_(1, slot_offset_t, kv)
-            self.score_state[:bsz].index_copy_(1, slot_offset_t, score)
-
-            # Always compute the compressed kv (cheap fixed-shape op). The
-            # softmax masks out -inf (unfilled) score entries naturally, so
-            # mid-cycle compressions return a partial pool that's just
-            # ignored on non-compress steps.
-            kv_state = torch.cat(
-                [
-                    self.kv_state[:bsz, :ratio, :d],
-                    self.kv_state[:bsz, ratio:, d:],
-                ],
-                dim=1,
-            )
-            score_state = torch.cat(
-                [
-                    self.score_state[:bsz, :ratio, :d],
-                    self.score_state[:bsz, ratio:, d:],
-                ],
-                dim=1,
-            )
-            kv_compressed = (kv_state * score_state.softmax(dim=1)).sum(
-                dim=1, keepdim=True
-            )
-
-            # Where-masked shift: only when should_compress.
-            mask_shift = should_compress_t.view(1, 1, 1)  # [1, 1, 1] for broadcast
-            self.kv_state[:bsz, :ratio] = torch.where(
-                mask_shift,
-                self.kv_state[:bsz, ratio : 2 * ratio],
-                self.kv_state[:bsz, :ratio],
-            )
-            self.score_state[:bsz, :ratio] = torch.where(
-                mask_shift,
-                self.score_state[:bsz, ratio : 2 * ratio],
-                self.score_state[:bsz, :ratio],
-            )
         else:
-            # No-overlap path. ratio != 4 layer (rare). Same idea.
-            self.kv_state[:bsz].index_copy_(1, slot_t, kv)
-            self.score_state[:bsz].index_copy_(1, slot_t, score)
-            kv_compressed = (
-                self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)
-            ).sum(dim=1, keepdim=True)
+            should_compress = (start_pos + 1) % self.compress_ratio == 0
+            score = score + self.ape[start_pos % ratio]
+            if overlap:
+                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    kv_state = torch.cat(
+                        [
+                            self.kv_state[:bsz, :ratio, :d],
+                            self.kv_state[:bsz, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    score_state = torch.cat(
+                        [
+                            self.score_state[:bsz, :ratio, :d],
+                            self.score_state[:bsz, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    kv = (kv_state * score_state.softmax(dim=1)).sum(
+                        dim=1, keepdim=True
+                    )
+                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+            else:
+                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    kv = (
+                        self.kv_state[:bsz]
+                        * self.score_state[:bsz].softmax(dim=1)
+                    ).sum(dim=1, keepdim=True)
 
-        # Apply norm + rope to the compressed kv. These are cheap fixed-
-        # shape ops; we run them every step (the result is overwritten on
-        # non-compress steps anyway).
-        kv_compressed = self.norm(kv_compressed.to(out_dtype))
-        # rope freqs row: ``self.freqs_cis[start_pos + 1 - ratio]``. The
-        # row pointer is host-int derived; build it from the tensor side
-        # via ``index_select`` so capture works.
-        freqs_row_idx = (start_pos_tensor + 1 - ratio).clamp(min=0)
-        freqs_cis = self.freqs_cis.index_select(0, freqs_row_idx)
-        apply_rotary_emb(kv_compressed[..., -rd:], freqs_cis)
+        if not should_compress:
+            return None
 
-        # Where-masked write to kv_cache. Slot index = start_pos // ratio
-        # (clamped >= 0 — for the first <ratio steps where should_compress
-        # is False, we'd index slot 0 with the OLD value, which is fine
-        # because the mask preserves it).
-        cache_slot_t = (start_pos_tensor // ratio).clamp(min=0).long()  # [1]
-        old_at_slot = self.kv_cache.index_select(1, cache_slot_t)  # [bsz, 1, d]
-        old_at_slot = old_at_slot[:bsz]
-        new_at_slot = torch.where(
-            should_compress_t.view(1, 1, 1),
-            kv_compressed,
-            old_at_slot,
-        )
-        self.kv_cache[:bsz].index_copy_(1, cache_slot_t, new_at_slot)
+        kv = self.norm(kv.to(out_dtype))
+        if start_pos == 0:
+            freqs_cis = self.freqs_cis[:cutoff:ratio]
+        else:
+            freqs_cis = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+        apply_rotary_emb(kv[..., -rd:], freqs_cis)
 
-        # Decode caller (V4Attention / V4Indexer) ignores the return value;
-        # return None for symmetry with the legacy ``if not should_compress``
-        # path. The CALLER does NOT wrap this in `if x is not None` for
-        # decode (it only uses the return value during prefill, see
-        # V4Attention.forward's prefill branch).
-        return None
+        if start_pos == 0:
+            self.kv_cache[:bsz, : seqlen // ratio] = kv
+        else:
+            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        return kv
 
 
 class V4Indexer(nn.Module):
@@ -473,17 +379,6 @@ class V4Indexer(nn.Module):
             ),
             persistent=False,
         )
-        # Position arange over the full compressed slab — used by the
-        # decode-path -inf mask (Stage-3 cudagraph rewrite). Registered as
-        # a non-persistent buffer so the data pointer is stable across
-        # captures; cudagraph snapshots it once at capture time.
-        self.register_buffer(
-            "_pos_arange",
-            torch.arange(
-                args.max_seq_len // compress_ratio, dtype=torch.long
-            ),
-            persistent=False,
-        )
         self.freqs_cis: Optional[torch.Tensor] = None
 
     def forward(
@@ -492,26 +387,12 @@ class V4Indexer(nn.Module):
         qr: torch.Tensor,
         start_pos: int,
         offset: int,
-        start_pos_tensor: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """V4 indexer forward.
-
-        Decode path (start_pos > 0) is the Stage-3 cudagraph capture
-        target. The variable-T einsum + variable-K topk of the original
-        formulation are replaced by a fixed-shape pair: score against the
-        full ``[max_seq//ratio]`` slab, mask future slots to ``-inf``,
-        ``topk(index_topk)`` always returning the same K, then map any
-        ``-inf``-valued topk slot to the ``-1`` skip sentinel that the
-        sparse-attn kernel already understands. Prefill stays eager;
-        the rewrite is capture-friendly so the decode path can be
-        captured once Stage 3 lands (cudagraph engagement deferred —
-        see SESSION_17_CONTINUATION.md for the three remaining
-        blockers).
-        """
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+        end_pos = start_pos + seqlen
 
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
@@ -521,76 +402,39 @@ class V4Indexer(nn.Module):
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
 
-        self.compressor(x, start_pos, start_pos_tensor)
+        self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (
             self.softmax_scale * self.n_heads**-0.5
         )
 
-        # Match reference dtype handling: cast q to float for the einsum
-        # to avoid fp16 over/underflow on the dot product; the score path
-        # is fp32 anyway via softmax.
+        # bshd × btd → bsht. Match reference dtype handling: cast q & kv to
+        # float for the einsum to avoid fp16 over/underflow on the dot
+        # product; the score path is fp32 anyway via softmax.
         q_f = q.float()
+        kv_f = self.kv_cache[:bsz, : end_pos // ratio].float()
+        index_score = torch.einsum("bshd,btd->bsht", q_f, kv_f)
+        index_score = (index_score.relu_() * weights.float().unsqueeze(-1)).sum(
+            dim=2
+        )
 
         if start_pos == 0:
-            # Prefill: variable slice + triangular mask (kept eager — the
-            # full einsum's 1 GB peak warning lives here, and prefill is
-            # never in the cudagraph capture set).
-            end_pos = start_pos + seqlen
-            kv_f = self.kv_cache[:bsz, : end_pos // ratio].float()
-            index_score = torch.einsum("bshd,btd->bsht", q_f, kv_f)
-            index_score = (
-                index_score.relu_() * weights.float().unsqueeze(-1)
-            ).sum(dim=2)
             mask = torch.arange(
                 seqlen // ratio, device=index_score.device
             ).repeat(seqlen, 1) >= torch.arange(
                 1, seqlen + 1, device=index_score.device
             ).unsqueeze(1) // ratio
             index_score += torch.where(mask, float("-inf"), 0.0)
-            topk_idxs = index_score.topk(
-                min(self.index_topk, end_pos // ratio), dim=-1
-            )[1]
+
+        topk_idxs = index_score.topk(
+            min(self.index_topk, end_pos // ratio), dim=-1
+        )[1]
+        if start_pos == 0:
             mask = topk_idxs >= torch.arange(
                 1, seqlen + 1, device=topk_idxs.device
             ).unsqueeze(1) // ratio
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-            return topk_idxs
-
-        # Decode (Stage-3 capture path). Score against the full compressed
-        # slab and mask future positions to -inf.
-        # kv_cache shape: (max_batch_size, max_seq//ratio, head_dim).
-        # Decode bsz=1, seqlen=1 → einsum result
-        # [1, 1, n_heads=64, max_seq//ratio=1024] fp32 ≈ 256 KB per call.
-        if start_pos_tensor is None:
-            # Test/standalone path mirror (cf. V4Compressor.forward). The
-            # layers-level ``V4Attention`` exercised by the kernel-
-            # equivalence tests passes only ``start_pos`` (4-arg call),
-            # which lands here as ``start_pos_tensor=None``. Production
-            # V4Attention always provides the persistent buffer.
-            start_pos_tensor = torch.tensor(
-                [start_pos], dtype=torch.long, device=x.device
-            )
-
-        kv_f_full = self.kv_cache[:bsz].float()
-        index_score = torch.einsum("bshd,btd->bsht", q_f, kv_f_full)
-        index_score = (
-            index_score.relu_() * weights.float().unsqueeze(-1)
-        ).sum(dim=2)
-        # Mask indices >= n_compressed = (start_pos + seqlen) // ratio
-        # with -inf so the topk can't pick them. ``_pos_arange`` is the
-        # persistent buffer registered at __init__ — same shape as the
-        # last dim of ``index_score``.
-        n_compressed_t = ((start_pos_tensor + seqlen) // ratio).long()
-        mask = self._pos_arange >= n_compressed_t  # broadcast [max_seq//ratio]
-        index_score = index_score.masked_fill(mask, float("-inf"))
-        # Fixed K — masked-out slots return -inf scores and are remapped
-        # to the kernel's -1 skip sentinel below. This trades a variable
-        # ``min(index_topk, end_pos // ratio)`` for a fixed K, which is
-        # the entire point of Stage-3 capture.
-        topk_vals, topk_idxs = index_score.topk(self.index_topk, dim=-1)
-        topk_idxs = torch.where(
-            topk_vals == float("-inf"), -1, topk_idxs + offset
-        )
+        else:
+            topk_idxs = topk_idxs + offset
         return topk_idxs
 
 

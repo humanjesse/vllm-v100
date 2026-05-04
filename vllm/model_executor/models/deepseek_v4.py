@@ -749,7 +749,6 @@ class V4Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         start_pos: int,
-        start_pos_tensor: torch.Tensor,
     ) -> torch.Tensor:
         """Single-request V4-Flash attention forward.
 
@@ -769,16 +768,10 @@ class V4Attention(nn.Module, AttentionLayerBase):
           positions          [num_tokens]
           hidden_states      [num_tokens, hidden_size]
           start_pos          scalar int — first position in this request's
-                             slice. Used for capture-time decisions (the
-                             ``start_pos == 0`` prefill branch) and as a
-                             host-only index into ``self.freqs_cis``.
-          start_pos_tensor   [1]-long device buffer mirror of start_pos.
-                             Owned by the V4 metadata builder, updated
-                             OUTSIDE captured graphs. Read by the decode-
-                             path tensor arithmetic (window topk +
-                             positions_seq + compressor slot writes) so
-                             the captured graph picks up the new value at
-                             every replay.
+                             slice. Computed once at
+                             ``DeepseekV4Model.forward`` from the V4
+                             attention metadata's CPU mirror and threaded
+                             down to avoid 43 per-layer host syncs.
 
         Returns [num_tokens, hidden_size].
         """
@@ -902,21 +895,9 @@ class V4Attention(nn.Module, AttentionLayerBase):
             # (``torch.where``) instead of two (``full(-1)`` + scatter), and
             # without a per-step ``arange`` alloc — ``self._win_arange`` is
             # cached at __init__.
-            #
-            # Stage-3 cudagraph rewrite: ``n_valid`` becomes a [1]-long
-            # device tensor (``n_valid_t``) computed from
-            # ``start_pos_tensor`` so the ``torch.where`` runs as a kernel
-            # whose mask is read at REPLAY time, not baked at capture. The
-            # output shape stays ``[win]`` (same as before); the front-pack
-            # invariant is preserved (entries [0, n_valid) are 0..n_valid-1,
-            # rest are -1) so tile 0 always has at least one valid index.
-            # ``n_valid_t`` is reused below in the kv-build decode branch
-            # (positions_seq construction). Both branches gate on the same
-            # ``start_pos == 0`` check so the variable is in scope, but
-            # naming it explicitly here documents the cross-block reuse.
-            n_valid_t = (start_pos_tensor + 1).clamp(max=win)
+            n_valid = min(start_pos + 1, win)
             win_topk = torch.where(
-                self._win_arange < n_valid_t, self._win_arange, -1
+                self._win_arange < n_valid, self._win_arange, -1
             )
             topk_idxs = win_topk.unsqueeze(0).unsqueeze(0).expand(
                 bsz, seqlen, -1
@@ -930,7 +911,7 @@ class V4Attention(nn.Module, AttentionLayerBase):
             offset = seqlen if start_pos == 0 else win
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(
-                    x, qr, start_pos, offset, start_pos_tensor
+                    x, qr, start_pos, offset
                 )
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
@@ -945,7 +926,7 @@ class V4Attention(nn.Module, AttentionLayerBase):
             # paged-cache contents we just wrote). Concat optional compressor
             # output. Kernel signature ``n = seqlen + seqlen//ratio``.
             if self.compress_ratio:
-                kv_compress = self.compressor(x, start_pos, start_pos_tensor)
+                kv_compress = self.compressor(x, start_pos)
                 if kv_compress is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
             kv_kernel = kv
@@ -970,34 +951,22 @@ class V4Attention(nn.Module, AttentionLayerBase):
             block_size = attn_meta.block_size
             # bsz==1 contract: only one row of the block table is consumed.
             bt_row = attn_meta.block_table[0].long()
-            # Stage-3 cudagraph rewrite: positions_seq is now FIXED-shape
-            # [win] (was variable [n_valid]). Slots [0, n_valid) hold the
-            # actual valid positions [start_pos - n_valid + 1, start_pos];
-            # slots [n_valid, win) clamp to ``start_pos`` (re-read of the
-            # newest position's KV — masked by topk_idxs == -1 in those
-            # slots, see ``win_topk`` above). The clamp guarantees every
-            # gather index is in-range for the cache.
-            #
-            # Trade-off: ~64x bandwidth on early decode (gather all 4096
-            # slots vs n_valid). The kernel still masks via -1 topk_idxs so
-            # the wasted reads never reach the gemm. We accept this for
-            # cudagraph eligibility — capture wins back ~70 ms/step of
-            # Python overhead which dominates the per-step cost at bsz=1.
-            positions_seq = (
-                self._win_arange + (start_pos_tensor - n_valid_t + 1)
-            ).clamp(min=0).clamp(max=start_pos_tensor)
+            # Variable-shape positions_seq (Pass 1+2 from session 14):
+            # gathers exactly the n_valid slots we need, no wasted bandwidth.
+            positions_seq = self._win_arange[:n_valid] + (
+                start_pos - n_valid + 1
+            )
             block_in_req = positions_seq // block_size
             slot_in_block = positions_seq % block_size
             global_slots = bt_row[block_in_req] * block_size + slot_in_block
-            # Write the full gather into the workspace's window slots —
-            # fixed slice [:win] (was variable [:n_valid]).
-            self._kv_kernel_decode[0, :win, :] = flat_paged[global_slots]
+            # Write the gather into the workspace's window slots [0, n_valid).
+            self._kv_kernel_decode[0, :n_valid, :] = flat_paged[global_slots]
 
             if self.compress_ratio:
                 # Compressor still maintains its own state; the call writes
                 # into ``self.compressor.kv_cache`` which is a view of
                 # ``_kv_kernel_decode[:, win:, :]``, so no copy is needed.
-                self.compressor(x, start_pos, start_pos_tensor)
+                self.compressor(x, start_pos)
 
             kv_kernel = self._kv_kernel_decode
 
@@ -1206,7 +1175,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         start_pos: int,
-        start_pos_tensor: torch.Tensor,
     ) -> torch.Tensor:
         """One transformer block. Mirrors reference Block.forward.
 
@@ -1215,11 +1183,6 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ``start_pos`` is derived once per ``DeepseekV4Model.forward`` from
         the V4 attention metadata and threaded through the layer stack.
-        ``start_pos_tensor`` is the [1]-long device-buffer mirror of the
-        same value, used by V4Attention's decode path for capturable
-        tensor-shape arithmetic (Stage-3 cudagraph). Both are forwarded to
-        V4Attention; the int form is still consumed for capture-time
-        decisions (e.g. the prefill ``start_pos == 0`` Python branch).
         """
         # ATTN sub-block: hc_pre → attn_norm → V4Attention → hc_post.
         residual = x
@@ -1243,7 +1206,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions,
             attn_in,
             start_pos=start_pos,
-            start_pos_tensor=start_pos_tensor,
         )
         if attn_out.dim() == 2:
             attn_out = attn_out.unsqueeze(0)
@@ -1318,18 +1280,6 @@ class DeepseekV4Model(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
 
-        # Persistent device buffer used as the start_pos_tensor fallback when
-        # ``attn_metadata`` is absent (profile_run, non-V4-backend paths).
-        # V4Attention short-circuits to zeros in those paths so the value is
-        # never consumed; we just need a valid [1]-long tensor on the right
-        # device for the layer-stack signature. Lives on the layers' device
-        # (whatever ``register_buffer`` sees as default at module-init).
-        self.register_buffer(
-            "_start_pos_zero",
-            torch.zeros((1,), dtype=torch.long),
-            persistent=False,
-        )
-
         # HC head reduction params (reference Transformer.hc_head_*). Used
         # at the end of forward to collapse hc_mult copies → 1.
         self.hc_head_fn = nn.Parameter(
@@ -1386,24 +1336,14 @@ class DeepseekV4Model(nn.Module):
         if isinstance(fc_attn_meta, list):
             fc_attn_meta = fc_attn_meta[0] if fc_attn_meta else None
         start_pos = 0
-        # ``start_pos_tensor`` is the [1]-long device-buffer mirror of the int.
-        # See ``DeepSeekV4FlashV100MetadataBuilder.build`` — same data pointer
-        # across steps, ``fill_``ed per step. Stage-3 cudagraph reads it at
-        # replay time so a single captured graph covers all decode steps.
-        # Fallback ``self._start_pos_zero`` (a fixed device zero) for
-        # profile_run / non-V4-backend paths that short-circuit before
-        # consuming it (V4Attention returns zeros when attn_meta is None).
-        start_pos_tensor: torch.Tensor = self._start_pos_zero
         if isinstance(fc_attn_meta, dict):
             for v in fc_attn_meta.values():
                 if isinstance(v, DeepSeekV4FlashV100Metadata):
                     start_pos = v.start_pos
-                    if v.start_pos_tensor is not None:
-                        start_pos_tensor = v.start_pos_tensor
                     break
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            h = layer(h, positions, input_ids, start_pos, start_pos_tensor)
+            h = layer(h, positions, input_ids, start_pos)
 
         # Reduce HC copies via the model-level hc_head params, then norm.
         h = _hc_head(

@@ -188,20 +188,8 @@ class DeepSeekV4FlashV100Metadata(AttentionMetadata):
     # ``DeepSeekV4FlashV100MetadataBuilder.build`` from
     # ``query_start_loc_cpu`` + ``_seq_lens_cpu`` (both already populated by
     # the runner — no GPU sync). The model reads this instead of
-    # ``int(positions[0].item())`` so the per-forward host sync goes to zero,
-    # which is a Stage-3 cudagraph prerequisite.
+    # ``int(positions[0].item())`` so the per-forward host sync goes to zero.
     start_pos: int = 0
-
-    # Same value as ``start_pos`` exposed as a persistent device buffer ([1]
-    # long). The buffer is owned by the metadata builder and ``fill_``ed per
-    # step OUTSIDE any captured graph; the captured forward reads from the
-    # SAME data pointer at every replay, so a single graph covers all decode
-    # steps. The Python-int ``start_pos`` above is still used for prefill /
-    # capture-time decisions (e.g. the ``start_pos == 0`` Python branch in
-    # V4Attention.forward); the tensor version is what the decode-path tensor
-    # arithmetic (window topk, compressor slot writes) reads. Defaulted to
-    # None so test stubs that only set ``start_pos`` keep working.
-    start_pos_tensor: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +212,6 @@ class DeepSeekV4FlashV100MetadataBuilder(
     layer-specific and stays in the model.
     """
 
-    # Stage 3 (cudagraph engagement) deferred to session 18+: smoke test
-    # in session 17 surfaced three uncaptureable paths beyond Obstacles
-    # 1-5 — TileLang deprecation-warn (uncaptureable warnings.warn),
-    # TileLang JIT compile (pybind tir.Var construction), and the
-    # Hash-MoE Python-state contract (``_cached_input_ids`` setattr
-    # bypassed by inductor's compiled ``vllm.moe_forward`` op). Stays at
-    # NEVER until those land. See SESSION_17_CONTINUATION.md.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
     def __init__(
@@ -247,14 +228,6 @@ class DeepSeekV4FlashV100MetadataBuilder(
         # Reused across builds so we don't allocate per step.
         self.req_id_per_token_buffer = torch.empty(
             (max_batched,), dtype=torch.int32, device=self.device
-        )
-        # Persistent [1]-long device buffer for ``start_pos`` exposed as a
-        # tensor. Allocated ONCE here, ``fill_``ed per step in ``build()``
-        # below. The tensor's data pointer never changes, so a captured
-        # cudagraph that reads from this buffer sees the per-step value at
-        # replay time without recapture.
-        self._start_pos_buf = torch.zeros(
-            (1,), dtype=torch.long, device=self.device
         )
 
     def build(
@@ -301,12 +274,6 @@ class DeepSeekV4FlashV100MetadataBuilder(
             if cm._seq_lens_cpu is not None:
                 start_pos = int(cm._seq_lens_cpu[0]) - query_len_0
 
-        # Mirror start_pos into the persistent device buffer; the captured
-        # forward (Stage 3) reads ``start_pos_tensor`` at replay time from
-        # this same data pointer. ``fill_`` runs OUTSIDE the captured region
-        # (build() is called by the runner before the model forward).
-        self._start_pos_buf.fill_(start_pos)
-
         return DeepSeekV4FlashV100Metadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
@@ -318,7 +285,6 @@ class DeepSeekV4FlashV100MetadataBuilder(
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             start_pos=start_pos,
-            start_pos_tensor=self._start_pos_buf,
         )
 
 
