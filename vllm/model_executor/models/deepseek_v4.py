@@ -94,11 +94,13 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.deepseek_v4_v100 import (
     DeepSeekV4FlashV100Backend,
+    DeepSeekV4FlashV100Metadata,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -654,17 +656,25 @@ class V4Attention(nn.Module, AttentionLayerBase):
             self.compressor = None
             self.indexer = None
 
-        # Module-level KV buffer (window + compressed pool). NOT vLLM-paged —
-        # see class docstring. Sized to max_batch × (window + max_seq/ratio).
-        kv_cache_size = self.window_size + (
-            v4_args.max_seq_len // self.compress_ratio
-            if self.compress_ratio
-            else 0
-        )
+        # Decode-path kv_kernel workspace. Holds [window | compressor pool]
+        # contiguously so the per-step ``cat`` (~4 MB / layer / step) is
+        # eliminated. The compressor's kv_cache becomes a view into this
+        # workspace's compressor region; the gather writes into the window
+        # region directly. For ratio==0 layers the workspace is just the
+        # window region. Allocated bsz=1 (Stage-1 contract).
+        if self.compress_ratio:
+            self._max_compressed = (
+                v4_args.max_seq_len // self.compress_ratio
+            )
+        else:
+            self._max_compressed = 0
         self.register_buffer(
-            "kv_cache",
+            "_kv_kernel_decode",
             torch.zeros(
-                v4_args.max_batch_size, kv_cache_size, self.head_dim
+                1,
+                self.window_size + self._max_compressed,
+                self.head_dim,
+                dtype=torch.float16,
             ),
             persistent=False,
         )
@@ -684,6 +694,15 @@ class V4Attention(nn.Module, AttentionLayerBase):
             v4_args.beta_slow,
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+        # Cached arange[0..window_size-1] used by the decode hot path to
+        # build win_topk and the per-step positions_seq without allocating
+        # fresh tensors. Lives on whatever device the layer ends up on.
+        self.register_buffer(
+            "_win_arange",
+            torch.arange(self.window_size, dtype=torch.long),
+            persistent=False,
+        )
 
         # Register in the static forward context so vLLM's KV cache manager
         # discovers this layer and calls get_kv_cache_spec on it.
@@ -706,22 +725,22 @@ class V4Attention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(
         self, vllm_config: VllmConfig
     ) -> KVCacheSpec | None:
-        # First-runnable scope: V4Attention uses MODULE-LEVEL KV buffers
-        # (``self.kv_cache``, ``self.compressor.kv_state/score_state``,
-        # ``self.indexer.kv_cache``) rather than vLLM's paged cache. Returning
-        # None tells vLLM "this layer doesn't need a vLLM-managed KV cache",
-        # which has TWO important consequences in vllm.v1.engine.core
-        # ``_initialize_kv_caches``: (a) no paged cache is allocated for
-        # this layer (avoiding wasted GPU memory we'd never touch), and
-        # (b) when EVERY attention layer returns None, ``has_kv_cache``
-        # evaluates False and the engine SKIPS ``profile_run`` entirely
-        # (the V4-Flash + replicated-indexer activation footprint at
-        # max_num_batched_tokens=4096 was OOMing the 32GB V100 even at
-        # TP=8). This is the right fall-back as long as we use module-level
-        # buffers; once we lift compressor/indexer/main-window cache into
-        # vLLM-paged form (open work item in SESSION_8_CONTINUATION.md),
-        # return real MLAAttentionSpec instances here.
-        return None
+        # Stage 1: main-window K is paged. Compressor + indexer state remain
+        # module-level for now; their lift is Stage 2. The spec covers only
+        # the main MLA cache; one entry per token, ``head_size = head_dim``,
+        # MLA fan-in 1 (latent K).
+        cache_config = vllm_config.cache_config
+        block_size = (
+            cache_config.block_size
+            if cache_config is not None and cache_config.block_size is not None
+            else 64
+        )
+        return MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=torch.float16,
+        )
 
     # ---- forward (session 7: first-runnable wiring) ----
 
@@ -730,28 +749,36 @@ class V4Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         start_pos: int,
+        start_pos_tensor: torch.Tensor,
     ) -> torch.Tensor:
         """Single-request V4-Flash attention forward.
 
-        First-runnable scope (session 7):
+        Stage 1 scope (paged main KV cache):
           * Single contiguous request per call (bsz=1). Multi-request
-            mixed batches and prefix caching are deferred until we move
-            the windowed KV into vLLM's paged cache.
-          * KV state lives entirely in module-level buffers
-            (``self.kv_cache``, ``self.compressor.kv_state``,
-            ``self.indexer.kv_cache`` etc.) — vLLM's paged KV cache is
-            allocated by the spec but unused.
+            mixed batches and prefix caching land in Stage 2 once the
+            compressor + indexer caches are also paged.
+          * Main-window K is read/written through vLLM's paged cache via
+            ``slot_mapping`` (write) and per-request positions remapped
+            to global cache slots (read, decode only). Compressor +
+            indexer state remain module-level for this stage.
           * Calls ``v100_sparse_attn`` directly rather than dispatching
             through ``DeepSeekV4FlashV100Backend.forward_mqa`` (the
             backend wrapper is exercised by the session-4 test).
 
         Inputs follow vLLM v1's flat shape:
-          positions     [num_tokens]
-          hidden_states [num_tokens, hidden_size]
-          start_pos     scalar int — first position in this request's
-                        slice. Computed once at ``DeepseekV4Model.forward``
-                        from ``positions[0]`` and threaded down to avoid
-                        43 per-layer host syncs.
+          positions          [num_tokens]
+          hidden_states      [num_tokens, hidden_size]
+          start_pos          scalar int — first position in this request's
+                             slice. Used for capture-time decisions (the
+                             ``start_pos == 0`` prefill branch) and as a
+                             host-only index into ``self.freqs_cis``.
+          start_pos_tensor   [1]-long device buffer mirror of start_pos.
+                             Owned by the V4 metadata builder, updated
+                             OUTSIDE captured graphs. Read by the decode-
+                             path tensor arithmetic (window topk +
+                             positions_seq + compressor slot writes) so
+                             the captured graph picks up the new value at
+                             every replay.
 
         Returns [num_tokens, hidden_size].
         """
@@ -769,7 +796,8 @@ class V4Attention(nn.Module, AttentionLayerBase):
         assert bsz == 1, (
             "V4Attention.forward currently supports a single contiguous "
             f"request per call (bsz=1); got bsz={bsz}. Multi-request batches "
-            "require lifting the windowed KV into vLLM's paged cache."
+            "require lifting the compressor/indexer caches into vLLM-paged "
+            "form (Stage 2)."
         )
 
         if start_pos > 0:
@@ -779,14 +807,51 @@ class V4Attention(nn.Module, AttentionLayerBase):
                 "prefix caching is out of scope for first runnable."
             )
 
+        # Pull paged-cache + per-step attn metadata from the forward context.
+        # ``attn_meta`` is None during ``profile_run`` (vLLM runs the model
+        # with synthetic inputs whose seqlen can exceed our freqs_cis range
+        # and without a scheduler-built block table). Short-circuit to a
+        # zero output of the right shape; vLLM will under-measure attention
+        # peak but the alternative (running the full forward with no cache
+        # + a too-short freqs_cis) crashes engine init.
+        forward_ctx = get_forward_context()
+        attn_meta_obj = forward_ctx.attn_metadata
+        if isinstance(attn_meta_obj, list):
+            # DBO: list-of-microbatch wrapper, take the first.
+            attn_meta_obj = attn_meta_obj[0] if attn_meta_obj else None
+        attn_meta: DeepSeekV4FlashV100Metadata | None = (
+            attn_meta_obj.get(self.prefix)
+            if isinstance(attn_meta_obj, dict)
+            else None
+        )
+        if attn_meta is None:
+            return torch.zeros_like(hidden_states)
+
+        paged_list = self.kv_cache  # vLLM-injected list[Tensor]
+        paged_cache: torch.Tensor | None = None
+        if isinstance(paged_list, list) and paged_list:
+            paged_cache = paged_list[forward_ctx.virtual_engine]
+            if paged_cache.numel() == 0:
+                paged_cache = None
+        assert paged_cache is not None, (
+            "V4Attention.forward: paged main KV cache not bound; "
+            "did vLLM's bind_kv_cache run after profile_run?"
+        )
+
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # Lazy bind of compressor/indexer buffers (matches reference).
+        # Lazy bind of compressor/indexer state to a view of the decode-path
+        # kv_kernel workspace. The compressor writes directly into the
+        # workspace's compressor region, so the per-step
+        # ``cat([window_kv, compressor.kv_cache])`` becomes a no-op. Stage 2
+        # will replace this with paged caches.
         if self.compress_ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.kv_cache = self._kv_kernel_decode[
+                :, self.window_size :, :
+            ]
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
@@ -804,15 +869,69 @@ class V4Attention(nn.Module, AttentionLayerBase):
         kv = self.kv_norm(kv)
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
 
-        # Build sparse-attn topk indices: window indices, then optional
-        # compressed-pool indices (from indexer or static helper).
-        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(
-            x.device
-        )
+        # Write fresh K to the paged cache via slot_mapping. ``slot_mapping``
+        # is per-token global-slot offsets (monotonic for a contiguous req),
+        # so this writes ALL of this step's tokens — no rolling/modulo.
+        flat_paged = paged_cache.view(-1, self.head_dim)
+        slot_mapping = attn_meta.slot_mapping
+        if slot_mapping.dtype != torch.long:
+            slot_mapping = slot_mapping.long()
+        # bsz==1 contract: num_actual_tokens == seqlen, kv is [1, seqlen, d].
+        # kv and flat_paged are both fp16 in the V100 strict-fp16 contract;
+        # dropping the per-step .to(flat_paged.dtype) saves an aten::to
+        # dispatch per layer.
+        flat_paged.index_copy_(0, slot_mapping, kv.squeeze(0))
+
+        # Build sparse-attn topk indices. The kernel processes topk_idxs in
+        # tiles of 64; if the first tile is ALL -1 the online-softmax state
+        # leaks NaN into ``acc_o`` (``scores_scale = exp(-inf - -inf) = NaN``)
+        # which then poisons all subsequent finite tiles. So we always pack
+        # valid window entries FIRST in topk_idxs (and at the FRONT of
+        # ``window_kv`` below).
+        if start_pos == 0:
+            # Prefill: kernel reads the freshly-projected ``kv`` directly,
+            # so window indices are positions 0..seqlen-1 (in the fresh-kv
+            # layout). Same as before paging — already front-packed.
+            topk_idxs = get_window_topk_idxs(
+                win, bsz, seqlen, start_pos
+            ).to(x.device)
+        else:
+            # Decode: ``window_kv`` is a per-step workspace with valid K at
+            # slots [0, n_valid) and zero-padding after. So window_topk =
+            # [0, 1, ..., n_valid-1, -1, ..., -1]. Built in one CUDA op
+            # (``torch.where``) instead of two (``full(-1)`` + scatter), and
+            # without a per-step ``arange`` alloc — ``self._win_arange`` is
+            # cached at __init__.
+            #
+            # Stage-3 cudagraph rewrite: ``n_valid`` becomes a [1]-long
+            # device tensor (``n_valid_t``) computed from
+            # ``start_pos_tensor`` so the ``torch.where`` runs as a kernel
+            # whose mask is read at REPLAY time, not baked at capture. The
+            # output shape stays ``[win]`` (same as before); the front-pack
+            # invariant is preserved (entries [0, n_valid) are 0..n_valid-1,
+            # rest are -1) so tile 0 always has at least one valid index.
+            # ``n_valid_t`` is reused below in the kv-build decode branch
+            # (positions_seq construction). Both branches gate on the same
+            # ``start_pos == 0`` check so the variable is in scope, but
+            # naming it explicitly here documents the cross-block reuse.
+            n_valid_t = (start_pos_tensor + 1).clamp(max=win)
+            win_topk = torch.where(
+                self._win_arange < n_valid_t, self._win_arange, -1
+            )
+            topk_idxs = win_topk.unsqueeze(0).unsqueeze(0).expand(
+                bsz, seqlen, -1
+            )
+
         if self.compress_ratio:
-            offset = kv.size(1) if start_pos == 0 else win
+            # The compressed-pool offset in the kv tensor passed to the
+            # kernel (see kv_kernel construction below): for prefill it's
+            # ``seqlen`` (the fresh-kv length); for decode it's ``win`` (the
+            # window-gather workspace length). Same convention as before.
+            offset = seqlen if start_pos == 0 else win
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+                compress_topk_idxs = self.indexer(
+                    x, qr, start_pos, offset, start_pos_tensor
+                )
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     ratio, bsz, seqlen, start_pos, offset
@@ -820,39 +939,78 @@ class V4Attention(nn.Module, AttentionLayerBase):
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
-        # KV cache write + sparse attention.
+        # Build the kv tensor passed to the kernel.
         if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                tail = kv[:, -win:]
-                head = tail[:, : win - cutoff]
-                rest = tail[:, win - cutoff :]
-                self.kv_cache[:bsz, cutoff:win] = head
-                self.kv_cache[:bsz, :cutoff] = rest
+            # Prefill: use the freshly-projected K directly (matches the
+            # paged-cache contents we just wrote). Concat optional compressor
+            # output. Kernel signature ``n = seqlen + seqlen//ratio``.
             if self.compress_ratio:
-                kv_compress = self.compressor(x, start_pos)
+                kv_compress = self.compressor(x, start_pos, start_pos_tensor)
                 if kv_compress is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
-            o = v100_sparse_attn(
-                q.to(torch.float16),
-                kv.to(torch.float16),
-                self.attn_sink,
-                topk_idxs,
-                self.softmax_scale,
-            ).to(x.dtype)
+            kv_kernel = kv
         else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            # Decode: gather the window region from the paged cache directly
+            # into the pre-allocated ``_kv_kernel_decode`` workspace, packing
+            # valid positions at the front of the window region (matches the
+            # front-packed topk layout above). Kernel signature
+            # ``n = win + max_compressed`` — fixed, no fresh JIT.
+            #
+            # The unused window tail (``[:, n_valid:win, :]``) has stale
+            # content from the previous step. The kernel masks any topk_idx
+            # == -1 entry to 0 in its online softmax (see
+            # ``deepseek_v4_v100_kernels.py:95``), so unused tail content
+            # never reaches the gemm. Skipping the per-step zero-pad saves
+            # ~3 MB DRAM bandwidth per layer per step.
+            #
+            # The compressor portion (``[:, win:, :]``) is filled by
+            # ``self.compressor(x, start_pos)`` below — its kv_cache is bound
+            # to a view of this workspace, so the write lands in place with
+            # no copy.
+            block_size = attn_meta.block_size
+            # bsz==1 contract: only one row of the block table is consumed.
+            bt_row = attn_meta.block_table[0].long()
+            # Stage-3 cudagraph rewrite: positions_seq is now FIXED-shape
+            # [win] (was variable [n_valid]). Slots [0, n_valid) hold the
+            # actual valid positions [start_pos - n_valid + 1, start_pos];
+            # slots [n_valid, win) clamp to ``start_pos`` (re-read of the
+            # newest position's KV — masked by topk_idxs == -1 in those
+            # slots, see ``win_topk`` above). The clamp guarantees every
+            # gather index is in-range for the cache.
+            #
+            # Trade-off: ~64x bandwidth on early decode (gather all 4096
+            # slots vs n_valid). The kernel still masks via -1 topk_idxs so
+            # the wasted reads never reach the gemm. We accept this for
+            # cudagraph eligibility — capture wins back ~70 ms/step of
+            # Python overhead which dominates the per-step cost at bsz=1.
+            positions_seq = (
+                self._win_arange + (start_pos_tensor - n_valid_t + 1)
+            ).clamp(min=0).clamp(max=start_pos_tensor)
+            block_in_req = positions_seq // block_size
+            slot_in_block = positions_seq % block_size
+            global_slots = bt_row[block_in_req] * block_size + slot_in_block
+            # Write the full gather into the workspace's window slots —
+            # fixed slice [:win] (was variable [:n_valid]).
+            self._kv_kernel_decode[0, :win, :] = flat_paged[global_slots]
+
             if self.compress_ratio:
-                self.compressor(x, start_pos)
-            o = v100_sparse_attn(
-                q.to(torch.float16),
-                self.kv_cache[:bsz].to(torch.float16),
-                self.attn_sink,
-                topk_idxs,
-                self.softmax_scale,
-            ).to(x.dtype)
+                # Compressor still maintains its own state; the call writes
+                # into ``self.compressor.kv_cache`` which is a view of
+                # ``_kv_kernel_decode[:, win:, :]``, so no copy is needed.
+                self.compressor(x, start_pos, start_pos_tensor)
+
+            kv_kernel = self._kv_kernel_decode
+
+        # q, kv_kernel, sparse_attn output, and x are all fp16 in the V100
+        # strict-fp16 contract; the .to(torch.float16) and .to(x.dtype) calls
+        # were per-step no-op dispatches (~6 aten::to/_to_copy ops/layer).
+        o = v100_sparse_attn(
+            q,
+            kv_kernel,
+            self.attn_sink,
+            topk_idxs,
+            self.softmax_scale,
+        )
 
         # Inverse rotary on the rope-dims of the output.
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
@@ -869,7 +1027,7 @@ class V4Attention(nn.Module, AttentionLayerBase):
         # so groups don't mix.
         in_per_group = self.n_heads * self.head_dim // self.n_groups
         if self._wo_a_quant:
-            o = o.flatten(2).to(torch.float16)
+            o = o.flatten(2)  # already fp16 from sparse_attn output
             o, _ = self.wo_a(o)
         else:
             n_local_groups = self.n_local_groups
@@ -1048,6 +1206,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         start_pos: int,
+        start_pos_tensor: torch.Tensor,
     ) -> torch.Tensor:
         """One transformer block. Mirrors reference Block.forward.
 
@@ -1055,9 +1214,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         Returns the same shape (HC-expanded).
 
         ``start_pos`` is derived once per ``DeepseekV4Model.forward`` from
-        ``positions[0]`` and threaded through the layer stack so each layer
-        avoids the per-layer host sync that ``int(positions[0].item())``
-        would otherwise force.
+        the V4 attention metadata and threaded through the layer stack.
+        ``start_pos_tensor`` is the [1]-long device-buffer mirror of the
+        same value, used by V4Attention's decode path for capturable
+        tensor-shape arithmetic (Stage-3 cudagraph). Both are forwarded to
+        V4Attention; the int form is still consumed for capture-time
+        decisions (e.g. the prefill ``start_pos == 0`` Python branch).
         """
         # ATTN sub-block: hc_pre → attn_norm → V4Attention → hc_post.
         residual = x
@@ -1077,7 +1239,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         # batch dim so the attn forward's own ``squeeze`` path triggers
         # consistently.
         attn_in = x_pre.squeeze(0) if x_pre.dim() == 3 else x_pre
-        attn_out = self.attn(positions, attn_in, start_pos=start_pos)
+        attn_out = self.attn(
+            positions,
+            attn_in,
+            start_pos=start_pos,
+            start_pos_tensor=start_pos_tensor,
+        )
         if attn_out.dim() == 2:
             attn_out = attn_out.unsqueeze(0)
         x = _hc_post(attn_out, residual, post, comb)
@@ -1151,6 +1318,18 @@ class DeepseekV4Model(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
 
+        # Persistent device buffer used as the start_pos_tensor fallback when
+        # ``attn_metadata`` is absent (profile_run, non-V4-backend paths).
+        # V4Attention short-circuits to zeros in those paths so the value is
+        # never consumed; we just need a valid [1]-long tensor on the right
+        # device for the layer-stack signature. Lives on the layers' device
+        # (whatever ``register_buffer`` sees as default at module-init).
+        self.register_buffer(
+            "_start_pos_zero",
+            torch.zeros((1,), dtype=torch.long),
+            persistent=False,
+        )
+
         # HC head reduction params (reference Transformer.hc_head_*). Used
         # at the end of forward to collapse hc_mult copies → 1.
         self.hc_head_fn = nn.Parameter(
@@ -1194,19 +1373,37 @@ class DeepseekV4Model(nn.Module):
         h = h.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
         # h is now [1, num_tokens, hc_mult, hidden_size]
 
-        # Derive start_pos once for the whole layer stack (rather than
-        # per-layer inside V4Attention.forward, which would cost a CPU-GPU
-        # sync per layer × 43 layers per forward). For the bsz=1 single-
-        # request contract that V4Attention.forward asserts, the first
-        # token's position is the start of this scheduling step's slice.
-        # One host sync per forward instead of 43.
-        if positions.dim() == 1:
-            start_pos = int(positions[0].item())
-        else:
-            start_pos = int(positions[0, 0].item())
+        # Derive start_pos once for the whole layer stack. Stage 3 cudagraph
+        # prerequisite: read it from the V4 backend's metadata (which the
+        # builder computed CPU-side from query_start_loc_cpu + _seq_lens_cpu)
+        # instead of ``int(positions[0].item())`` — which would force a
+        # GPU→CPU sync and prevent capture. ``attn_metadata`` is populated by
+        # the runner before the model forward; only ``profile_run`` (and any
+        # call site without a V4 backend metadata entry) leaves it None, in
+        # which case V4Attention.forward short-circuits to zeros and start_pos
+        # is unused, so the placeholder 0 is safe.
+        fc_attn_meta = get_forward_context().attn_metadata
+        if isinstance(fc_attn_meta, list):
+            fc_attn_meta = fc_attn_meta[0] if fc_attn_meta else None
+        start_pos = 0
+        # ``start_pos_tensor`` is the [1]-long device-buffer mirror of the int.
+        # See ``DeepSeekV4FlashV100MetadataBuilder.build`` — same data pointer
+        # across steps, ``fill_``ed per step. Stage-3 cudagraph reads it at
+        # replay time so a single captured graph covers all decode steps.
+        # Fallback ``self._start_pos_zero`` (a fixed device zero) for
+        # profile_run / non-V4-backend paths that short-circuit before
+        # consuming it (V4Attention returns zeros when attn_meta is None).
+        start_pos_tensor: torch.Tensor = self._start_pos_zero
+        if isinstance(fc_attn_meta, dict):
+            for v in fc_attn_meta.values():
+                if isinstance(v, DeepSeekV4FlashV100Metadata):
+                    start_pos = v.start_pos
+                    if v.start_pos_tensor is not None:
+                        start_pos_tensor = v.start_pos_tensor
+                    break
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            h = layer(h, positions, input_ids, start_pos)
+            h = layer(h, positions, input_ids, start_pos, start_pos_tensor)
 
         # Reduce HC copies via the model-level hc_head params, then norm.
         h = _hc_head(

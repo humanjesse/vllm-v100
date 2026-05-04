@@ -124,6 +124,7 @@ def build_engine(verbose: bool = True):
         max_num_seqs=4,
         gpu_memory_utilization=0.92,
         enable_prefix_caching=False,
+        block_size=64,  # V100 sparse_attn paged-cache helper uses BLOCK_N=64.
         trust_remote_code=False,
     )
     return llm
