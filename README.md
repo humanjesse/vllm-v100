@@ -10,6 +10,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 - **TurboMindLinearKernel** -- uses 1Cat's `awq_gemm_sm70` for dense linear layers instead of the Triton GPTQ kernel, which has ~2% mean relative error per matmul on V100 (compounds to garbage across deep networks). TurboMind achieves <0.1% error.
 - **MoE compressed-tensors fix** -- `CompressedTensorsSM70WNA16MoEMethod` was missing ~20 layer attributes needed by the AWQ apply path. Fixed by delegating to `AWQSM70MoEMethod` after CT-to-AWQ weight conversion.
 - **`_DEFAULT_MAX_TOKENS` naming fix** -- alias for renamed constant that broke the CT MoE import chain
+- **DeepSeek-V4-Flash on V100** -- runnable model class for Intel's W4A16 AutoRound quant of V4-Flash (290B / ~37B active, 256 experts, MLA + sparse attention + Hyper-Connections). Includes a V100 fp16 sparse-attention kernel port, a `_hc_post` clamp that prevents fp16 residual overflow at pos 0, an Obstacle-1 CPU-mirror `start_pos` in attention metadata that drops the per-forward host sync, and a paged main-window KV cache (single-request scope; multi-request via paged compressor/indexer caches is the natural Stage-2 follow-up).
 
 ## Verified models
 
@@ -20,6 +21,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | [tclf90/Qwen3.5-35B-A3B-AWQ](https://huggingface.co/tclf90/Qwen3.5-35B-A3B-AWQ) | 35B (3B active) | AWQ | MoE | 2-4 | Working (1Cat-validated) |
 | [tclf90/Qwen3.5-122B-A10B-AWQ](https://huggingface.co/tclf90/Qwen3.5-122B-A10B-AWQ) | 122B (10B active) | AWQ | MoE | 4+ | Working (1Cat-validated) |
 | [cyankiwi/Qwen3.6-27B-AWQ-INT4](https://huggingface.co/cyankiwi/Qwen3.6-27B-AWQ-INT4) | 27B | compressed-tensors W4A16 (asymmetric) | Hybrid Gated DeltaNet | 4 | Working (greedy + tool-calling smoke) |
+| [Intel/DeepSeek-V4-Flash-W4A16-AutoRound](https://huggingface.co/Intel/DeepSeek-V4-Flash-W4A16-AutoRound) | 290B (37B active) | auto-round W4A16 | MoE (256 experts) + MLA + sparse-attn + Hyper-Connections | 8 | Working (single-request, ~5.66 tok/s decode-only) |
 
 ## Hardware tested
 
@@ -105,6 +107,39 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc=host \
   --enforce-eager \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder
+```
+
+### Quick run (DeepSeek-V4-Flash on 8x V100 32GB)
+
+Single-request only (`bsz==1`); compressor and indexer KV are kept on
+module buffers rather than the paged cache for now. `--enforce-eager`
+is required (cudagraph engagement is blocked by three uncaptureable
+paths in the model -- TileLang JIT, TileLang deprecation warn, and a
+Hash-MoE Python-state contract; the realistic post-cudagraph speedup
+ceiling is also bounded by TP all-reduce dominating ~38% of decode-time
+GPU work, so eager is the practical ship target on V100 SXM2).
+`--max-num-seqs=4` is the sampler warmup OOM headroom; `block_size=64`
+matches the V100 sparse-attn kernel's `BLOCK_N`. Decode-only throughput
+in this configuration is ~5.66 tok/s warm (median ~5.27 across 4
+fresh-process runs at TP=8, 4096-token context).
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Intel/DeepSeek-V4-Flash-W4A16-AutoRound \
+  -e VLLM_SERVED_MODEL_NAME=V4-Flash-W4A16 \
+  -e VLLM_QUANTIZATION=auto-round \
+  -e VLLM_DTYPE=float16 \
+  -e VLLM_TENSOR_PARALLEL_SIZE=8 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.85 \
+  -e VLLM_MAX_MODEL_LEN=4096 \
+  -e VLLM_MAX_NUM_SEQS=4 \
+  -e VLLM_BLOCK_SIZE=64 \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
+  -p 8000:8000 \
+  vllm-v100:latest \
+  --enforce-eager \
+  --no-enable-prefix-caching
 ```
 
 ### Quick run (Qwen3.5-27B-AWQ on 2x V100)
