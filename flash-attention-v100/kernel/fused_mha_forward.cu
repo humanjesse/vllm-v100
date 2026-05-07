@@ -309,6 +309,18 @@ flash_attention_forward_kernel(
                 }
             }
 
+            // Include tail columns (when valid_k_rows is not a multiple of 4)
+            // in the row-max reduction. Without this, exp(v - new_max) for a
+            // large tail value can overflow the fp16 cast at sP_row_h[c],
+            // producing Inf that propagates through P·V into the attention
+            // output. Triggered most easily when M=N is not a multiple of 4.
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                if (c < valid_k_rows) {
+                    thread_max = fmaxf(thread_max, sS_row_f[c]);
+                }
+            }
+
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
                 thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
@@ -340,12 +352,46 @@ flash_attention_forward_kernel(
                 }
             }
 
+            // Split read/compute and write to break an sS/sP aliasing reorder.
+            // sS (float) and sP (__half) share storage via union(reuse_sp),
+            // so sP[row][c] aliases sS[row][c/2]. The two views go through
+            // different-typed pointers (float* vs __half*); under strict
+            // aliasing the compiler is allowed to reorder a sP store past a
+            // still-pending sS load from a different lane, and `#pragma
+            // unroll 4` exposes that opportunity. In a fused loop with
+            // valid_k_rows=11 (D=256, BLOCK_N=64, THREADS_PER_ROW=16), lane
+            // 8's iter-0 store sP[16]=0 (taking the c>=valid_k_rows else
+            // branch) could be issued before lane 0's iter-0 load of
+            // sS[8] in SIMT lockstep, clobbering it from -1e30 to 0;
+            // __expf(0 - row_max) then overflows fp16 and writes Inf into
+            // sP, which propagates through P*V into the attention output.
+            //
+            // Materializing all sS reads into a private register array
+            // before issuing any sP store closes the reorder window.
+            // The asm-volatile barrier between the two loops is a pure
+            // compiler memory barrier (zero runtime instructions) that
+            // prevents the optimizer from fusing them back together via
+            // CSE on tail_e[]. We avoid __syncwarp() here because this
+            // block is gated by `tid < valid_q_rows * THREADS_PER_ROW`,
+            // so the warp can be partially active — calling __syncwarp()
+            // with the default 0xFFFFFFFF mask in a partial warp is UB
+            // and deadlocks on Volta.
+            constexpr int TAIL_MAX = (BLOCK_N + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+            float tail_e[TAIL_MAX];
+            int   tail_n = 0;
             #pragma unroll 4
             for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
                 float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += (c < valid_k_rows) ? e : 0.0f;
-                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
+                tail_e[tail_n++] = (c < valid_k_rows) ? e : 0.0f;
+            }
+            asm volatile("" ::: "memory");
+            tail_n = 0;
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(tail_e[tail_n]) : __float2half(0.f);
+                ++tail_n;
             }
 
             #pragma unroll

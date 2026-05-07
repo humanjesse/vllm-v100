@@ -301,6 +301,18 @@ flash_attention_forward_kernel(
                 }
             }
 
+            // Include tail columns (when valid_k_rows is not a multiple of 4)
+            // in the row-max reduction. Without this, exp(v - new_max) for a
+            // large tail value can overflow the fp16 cast at sP_row_h[c],
+            // producing Inf that propagates through P·V into the attention
+            // output. (Same bug as fused_mha_forward.cu; tracks issue #29.)
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                if (c < valid_k_rows) {
+                    thread_max = fmaxf(thread_max, sS_row_f[c]);
+                }
+            }
+
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
                 thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
@@ -332,12 +344,29 @@ flash_attention_forward_kernel(
                 }
             }
 
+            // Split read/compute and write to break the sS/sP union aliasing
+            // reorder; see comment in fused_mha_forward.cu for the full
+            // mechanism. asm-volatile is a pure compiler barrier (zero
+            // runtime instructions) that prevents loop fusion via CSE on
+            // tail_e[]. __syncwarp() is unsafe here because the enclosing
+            // block is gated by `tid < valid_q_rows * THREADS_PER_ROW`, so
+            // the warp can be partially active.
+            constexpr int TAIL_MAX = (BLOCK_N + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+            float tail_e[TAIL_MAX];
+            int   tail_n = 0;
             #pragma unroll 4
             for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
                 float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += (c < valid_k_rows) ? e : 0.0f;
-                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
+                tail_e[tail_n++] = (c < valid_k_rows) ? e : 0.0f;
+            }
+            asm volatile("" ::: "memory");
+            tail_n = 0;
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(tail_e[tail_n]) : __float2half(0.f);
+                ++tail_n;
             }
 
             #pragma unroll
