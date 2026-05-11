@@ -180,6 +180,26 @@ DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
+# Required alignment of x.shape[1] (= ncols_x = K dim) for the MMQ kernel.
+# The kernel's outer K-loop steps by `blocks_per_warp = WARP_SIZE_GGUF / QI`
+# but its inner per-warp scale-load assumes all blocks_per_warp K-blocks exist;
+# when blocks_per_row_x is not a multiple of blocks_per_warp the last iteration
+# reads OOB scales (1 byte past the qweight buffer for Q5_0). The required
+# alignment is therefore qk * blocks_per_warp = qk * WARP_SIZE_GGUF / QI.
+# Triggers on small models where hidden % 256 != 0 (e.g. Qwen2.5-0.5B hidden=896).
+_MMQ_NCOLS_X_ALIGNMENT = {
+    int(WeightType.Q4_0): 256,
+    int(WeightType.Q4_1): 256,
+    int(WeightType.Q5_0): 256,
+    int(WeightType.Q5_1): 256,
+    int(WeightType.Q8_0): 128,
+    int(WeightType.Q2_K): 512,
+    int(WeightType.Q3_K): 512,
+    int(WeightType.Q4_K): 256,
+    int(WeightType.Q5_K): 256,
+    int(WeightType.Q6_K): 256,
+}
+
 
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
@@ -195,13 +215,16 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    mmq_alignment = _MMQ_NCOLS_X_ALIGNMENT.get(qweight_type, 0)
+    mmq_safe = mmq_alignment > 0 and x.shape[1] % mmq_alignment == 0
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    # Use MMQ Kernel if it's available (standard + k-quants) AND ncols_x is
+    # aligned for this quant type. Otherwise the kernel reads OOB scales.
+    elif qweight_type in MMQ_QUANT_TYPES and mmq_safe:
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
-    # If there is no available MMQ kernel, fallback to dequantize
+    # If MMQ unavailable or unaligned, fallback to dequantize.
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
@@ -526,7 +549,27 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            #
+            # `shard_id` is the per-shard registry order produced by
+            # `_create_padded_weight_param`, which iterates the order in
+            # which shards arrived during weight loading. That order can
+            # differ from the layer's definition order whenever the GGUF
+            # tensor names sort lexicographically into a different order
+            # than the model's `MergedColumnParallelLinear` shard list
+            # (e.g. Mistral4's `fused_qkv_a_proj` registers
+            # `[attn_q_a, attn_kv_a_mqa]` but `attn_kv_a_mqa` (Q8_0) loads
+            # before `attn_q_a` (Q6_K)). Iterating in load order then
+            # produces `cat([kv_a_out, q_a_out])` — the reverse of what
+            # the model's `split([q_lora, kv_split])` expects, silently
+            # corrupting downstream MLA computation.
+            #
+            # The QKV path is independently normalized via the canonical
+            # `["q", "k", "v"]` order; for everything else we sort the
+            # numeric shard ids so the apply iteration always matches the
+            # `packed_modules_mapping` declaration order (0, 1, 2, ...).
+            shard_id = (
+                ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
+            )
             qweight = layer.qweight
             result = []
             for idx in shard_id:

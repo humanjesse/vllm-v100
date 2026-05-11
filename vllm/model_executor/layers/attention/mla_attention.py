@@ -1005,7 +1005,7 @@ class MLACommonBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [576]
+        return [320, 576]
 
     @classmethod
     def is_mla(cls) -> bool:
@@ -1965,7 +1965,19 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         max_seqlen_q, max_seqlen_k, softmax_scale,
         causal=False, return_softmax_lse=False,
     ):
-        """SDPA-based varlen attention for SM70 MLA prefill."""
+        """SDPA-based varlen attention for sm_70 MLA prefill.
+
+        When ``return_softmax_lse`` is True (MLA's chunked-context merge),
+        ``F.scaled_dot_product_attention`` cannot expose the log-sum-exp —
+        softmax is fused inside the kernel — so the downstream
+        ``merge_attn_states`` CUDA op would receive ``None``. We compute
+        attention manually in fp32 and return LSE alongside the output;
+        shapes match the merge kernel (csrc/attention/merge_attn_states.cu:46):
+            output : [num_tokens, num_heads, head_dim] (same dtype as q)
+            lse    : [num_heads, num_tokens]            (fp32)
+        Otherwise fall through to the fused SDPA MATH backend in the input
+        dtype.
+        """
         maybe_padded_v = v
         if self._pad_v:
             maybe_padded_v = torch.nn.functional.pad(
@@ -1973,6 +1985,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         num_seqs = cu_seqlens_q.shape[0] - 1
         outputs = []
+        lses = [] if return_softmax_lse else None
         for i in range(num_seqs):
             q_start = cu_seqlens_q[i]
             q_end = cu_seqlens_q[i + 1]
@@ -1981,16 +1994,41 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             qi = q[q_start:q_end].unsqueeze(0).transpose(1, 2)
             ki = k[k_start:k_end].unsqueeze(0).transpose(1, 2)
             vi = maybe_padded_v[k_start:k_end].unsqueeze(0).transpose(1, 2)
-            with torch.nn.attention.sdpa_kernel(
-                torch.nn.attention.SDPBackend.MATH
-            ):
-                oi = torch.nn.functional.scaled_dot_product_attention(
-                    qi, ki, vi, scale=softmax_scale, is_causal=causal)
+            orig_dtype = qi.dtype
+
+            if return_softmax_lse:
+                qf = qi.float()
+                kf = ki.float()
+                vf = vi.float()
+                logits = (qf @ kf.transpose(-2, -1)) * float(softmax_scale)
+                if causal:
+                    q_seq = qf.shape[2]
+                    k_seq = kf.shape[2]
+                    mask = torch.triu(
+                        torch.full(
+                            (q_seq, k_seq), float("-inf"),
+                            device=qf.device, dtype=torch.float32,
+                        ),
+                        diagonal=1,
+                    )
+                    logits = logits + mask
+                lse = torch.logsumexp(logits, dim=-1)
+                weights = (logits - lse.unsqueeze(-1)).exp()
+                oi = (weights @ vf).to(orig_dtype)
+                lses.append(lse.squeeze(0))
+            else:
+                with torch.nn.attention.sdpa_kernel(
+                    torch.nn.attention.SDPBackend.MATH
+                ):
+                    oi = torch.nn.functional.scaled_dot_product_attention(
+                        qi, ki, vi, scale=softmax_scale, is_causal=causal)
+
             outputs.append(oi.transpose(1, 2).squeeze(0))
 
         attn_out = torch.cat(outputs, dim=0)
         if return_softmax_lse:
-            return attn_out, None
+            attn_lse = torch.cat(lses, dim=1)
+            return attn_out, attn_lse
         return attn_out
 
     def _run_prefill_new_tokens_sdpa(

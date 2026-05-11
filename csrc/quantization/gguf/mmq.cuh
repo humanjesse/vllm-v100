@@ -98,7 +98,9 @@ static __device__ __forceinline__ void mul_mat_q(
             if (row_dst >= nrows_dst) {
                 continue;
             }
-            dst[col_dst*nrows_dst + row_dst] = sum[i/WARP_SIZE_GGUF][j/nwarps];
+            // V100 fp16 overflow guard: see moe_vec.cuh.
+            const float s = sum[i/WARP_SIZE_GGUF][j/nwarps];
+            dst[col_dst*nrows_dst + row_dst] = fminf(fmaxf(s, -65504.0f), 65504.0f);
         }
     }
 }

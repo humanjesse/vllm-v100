@@ -48,7 +48,10 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
   }
 
   if (threadIdx.x == 0) {
-    dst[blockIdx.z * nrows + row] = tmp;
+    // V100 fp16 overflow guard: clamp fp32 accumulator to fp16 range before
+    // implicit cast. Avoids Inf cascade through downstream silu/down-proj on
+    // Mistral4 deep layers (post_attn_ln max ~55 × Q4_K weight outliers).
+    dst[blockIdx.z * nrows + row] = fminf(fmaxf(tmp, -65504.0f), 65504.0f);
   }
 }
 

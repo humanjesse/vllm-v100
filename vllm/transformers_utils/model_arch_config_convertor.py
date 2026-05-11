@@ -242,6 +242,7 @@ class ModelArchConfigConvertorBase:
             "kimi_k2",
             "kimi_linear",
             "longcat_flash",
+            "mistral4",
             "pangu_ultra_moe",
             "pangu_ultra_moe_mtp",
         ):

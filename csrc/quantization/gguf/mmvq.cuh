@@ -36,7 +36,8 @@ static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * 
     }
 
     if (threadIdx.x == 0) {
-        dst[vec*nrows + row] = tmp;
+        // V100 fp16 overflow guard: see moe_vec.cuh.
+        dst[vec*nrows + row] = fminf(fmaxf(tmp, -65504.0f), 65504.0f);
     }
 }
 

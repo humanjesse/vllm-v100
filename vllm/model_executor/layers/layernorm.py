@@ -202,6 +202,11 @@ class RMSNorm(CustomOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
+        # The custom rms_norm CUDA kernel only supports fp16/bf16; fall
+        # back to the native PyTorch impl for other dtypes.
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            return self.forward_native(x, residual)
+
         add_residual = residual is not None
         if add_residual:
             return fused_add_rms_norm(

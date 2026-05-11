@@ -654,10 +654,16 @@ def get_config(
 
     # Special architecture mapping check for GGUF models
     if _is_gguf:
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+        # Mistral4 is not in transformers' MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+        # (HF intends it to be wrapped by Mistral3ForConditionalGeneration);
+        # set architectures explicitly so the GGUF text-only path resolves.
+        if config.model_type == "mistral4":
+            config.update({"architectures": ["Mistral4ForCausalLM"]})
+        elif config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
+        else:
+            model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+            config.update({"architectures": [model_type]})
 
     # Architecture mapping for models without explicit architectures field
     if not config.architectures:
