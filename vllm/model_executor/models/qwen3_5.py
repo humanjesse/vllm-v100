@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import re
 from collections.abc import Iterable
 from itertools import islice
 
@@ -594,6 +595,59 @@ class Qwen3_5Model(Qwen3NextModel):
                     )
                     break
                 else:
+                    # Some FP16/BF16 checkpoints (e.g. Qwen3.6-35B-A3B) store
+                    # pre-fused all-expert MoE tensors instead of per-expert
+                    # weights:
+                    #   mlp.experts.gate_up_proj [N_experts, 2*ffn_dim, hidden]
+                    #   mlp.experts.down_proj    [N_experts, hidden, ffn_dim]
+                    # These names never match the per-expert entries in
+                    # expert_params_mapping, so without this branch they fall
+                    # through to the warn-and-skip path and the model loads
+                    # with all expert weights uninitialized (garbage output).
+                    if re.search(
+                        r"mlp\.experts\.(gate_up_proj|down_proj)$", name
+                    ):
+                        is_gate_up = name.endswith(".gate_up_proj")
+                        psuffix = "w13_weight" if is_gate_up else "w2_weight"
+                        pname = re.sub(
+                            r"mlp\.experts\.(gate_up_proj|down_proj)$",
+                            f"mlp.experts.{psuffix}",
+                            name,
+                        )
+                        if (
+                            not is_pp_missing_parameter(pname, self)
+                            and pname in params_dict
+                        ):
+                            p = params_dict[pname]
+                            n_exp = loaded_weight.shape[0]
+                            if is_gate_up:
+                                half = loaded_weight.shape[1] // 2
+                                for eid in range(n_exp):
+                                    p.weight_loader(
+                                        p,
+                                        loaded_weight[eid, :half, :].contiguous(),
+                                        pname,
+                                        shard_id="w1",
+                                        expert_id=eid,
+                                    )
+                                    p.weight_loader(
+                                        p,
+                                        loaded_weight[eid, half:, :].contiguous(),
+                                        pname,
+                                        shard_id="w3",
+                                        expert_id=eid,
+                                    )
+                            else:
+                                for eid in range(n_exp):
+                                    p.weight_loader(
+                                        p,
+                                        loaded_weight[eid].contiguous(),
+                                        pname,
+                                        shard_id="w2",
+                                        expert_id=eid,
+                                    )
+                            loaded_params.add(pname)
+                        continue
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
