@@ -918,9 +918,13 @@ __global__ void gather_and_maybe_dequant_cache(
 // SCALAR_T is the data type of the destination tensor.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE)                        \
-  vllm::gather_and_maybe_dequant_cache<SCALAR_T, CACHE_T, KV_DTYPE, 576,      \
-                                       thread_block_size>                     \
+// ENTRY_SIZE is the per-token entry size (== head_dim). Currently
+// instantiated for 320 (Mistral4 MLA: kv_lora_rank 256 + qk_rope_head_dim 64)
+// and 576 (DeepSeek-V3 MLA: kv_lora_rank 512 + qk_rope_head_dim 64).
+#define CALL_GATHER_CACHE_FOR_HEAD_DIM(SCALAR_T, CACHE_T, KV_DTYPE,           \
+                                      ENTRY_SIZE)                              \
+  vllm::gather_and_maybe_dequant_cache<SCALAR_T, CACHE_T, KV_DTYPE,           \
+                                       ENTRY_SIZE, thread_block_size>         \
       <<<grid, block, 0, stream>>>(                                           \
           reinterpret_cast<CACHE_T*>(src_cache.data_ptr()),                   \
           reinterpret_cast<SCALAR_T*>(dst.data_ptr()),                        \
@@ -929,6 +933,15 @@ __global__ void gather_and_maybe_dequant_cache(
           block_table_stride, cache_block_stride, cache_entry_stride,         \
           dst_entry_stride, reinterpret_cast<const float*>(scale.data_ptr()), \
           seq_starts_ptr);
+
+#define CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE)                        \
+  do {                                                                        \
+    if (head_dim == 320) {                                                    \
+      CALL_GATHER_CACHE_FOR_HEAD_DIM(SCALAR_T, CACHE_T, KV_DTYPE, 320);       \
+    } else {                                                                  \
+      CALL_GATHER_CACHE_FOR_HEAD_DIM(SCALAR_T, CACHE_T, KV_DTYPE, 576);       \
+    }                                                                         \
+  } while (0)
 
 // Gather sequences from the cache into the destination tensor.
 //  - cu_seq_lens contains the cumulative sequence lengths for each batch
@@ -959,9 +972,10 @@ void gather_and_maybe_dequant_cache(
     TORCH_CHECK(seq_starts.value().dtype() == torch::kInt32,
                 "seq_starts must be int32");
   }
-  TORCH_CHECK(head_dim == 576,
-              "gather_and_maybe_dequant_cache only support the head_dim to 576 "
-              "for better performance")
+  TORCH_CHECK(head_dim == 320 || head_dim == 576,
+              "gather_and_maybe_dequant_cache only supports head_dim 320 "
+              "(Mistral4 MLA) or 576 (DeepSeek-V3 MLA); got head_dim=",
+              head_dim)
 
   TORCH_CHECK(src_cache.device() == dst.device(),
               "src_cache and dst must be on the same device");

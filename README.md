@@ -11,6 +11,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 - **MoE compressed-tensors fix** -- `CompressedTensorsSM70WNA16MoEMethod` was missing ~20 layer attributes needed by the AWQ apply path. Fixed by delegating to `AWQSM70MoEMethod` after CT-to-AWQ weight conversion.
 - **`_DEFAULT_MAX_TOKENS` naming fix** -- alias for renamed constant that broke the CT MoE import chain
 - **DeepSeek-V4-Flash on V100** -- runnable model class for Intel's W4A16 AutoRound quant of V4-Flash (290B / ~37B active, 256 experts, MLA + sparse attention + Hyper-Connections). Includes a V100 fp16 sparse-attention kernel port, a `_hc_post` clamp that prevents fp16 residual overflow at pos 0, an Obstacle-1 CPU-mirror `start_pos` in attention metadata that drops the per-forward host sync, and a paged main-window KV cache (single-request scope; multi-request via paged compressor/indexer caches is the natural Stage-2 follow-up).
+- **Mistral-Small-4 119B GGUF on V100** -- runnable model class for Bartowski's Q4_K_M GGUF of Mistral-Small-4-119B-2603 (MoE, MLA, fused `ffn_gate_up_exps` + split `attn_k_b`/`attn_v_b` tensor layouts). Ships with three latent fixes that affect any GGUF or MLA user on V100: a 4-site fp16 overflow clamp in the GGUF csrc kernels (kept kernels' internal fp32 accumulator, clamped to ±65504 at the implicit fp32→fp16 write-back), an MMQ kernel alignment dispatch in `gguf.py` (small dense models like Qwen2.5-0.5B with hidden=896 now correctly fall back to dequantize instead of reading past the qweight buffer), and a manual fp32 LSE-returning fallback in `mla_attention.py` so MLA models with prefix caching / chunked prefill no longer crash `merge_attn_states` on V100.
 
 ## Verified models
 
@@ -23,6 +24,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | [cyankiwi/Qwen3.6-27B-AWQ-INT4](https://huggingface.co/cyankiwi/Qwen3.6-27B-AWQ-INT4) | 27B | compressed-tensors W4A16 (asymmetric) | Hybrid Gated DeltaNet | 4 | Working (greedy + tool-calling smoke) |
 | [cyankiwi/granite-4.1-8b-AWQ-INT4](https://huggingface.co/cyankiwi/granite-4.1-8b-AWQ-INT4) | 8B | compressed-tensors W4A16 group_size=32 (asymmetric) | Dense (GraniteForCausalLM) | 2 | Working (cudagraph; ~127 tok/s single-stream, ~587 tok/s aggregate batch=8) |
 | [Intel/DeepSeek-V4-Flash-W4A16-AutoRound](https://huggingface.co/Intel/DeepSeek-V4-Flash-W4A16-AutoRound) | 290B (37B active) | auto-round W4A16 | MoE (256 experts) + MLA + sparse-attn + Hyper-Connections | 8 | Working (single-request, ~5.66 tok/s decode-only) |
+| [bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF) (Q4_K_M) | 119B | GGUF Q4_K_M | MoE + MLA (`Mistral4ForCausalLM`) | 8 | Working (cudagraph; ~82 tok/s short prompt, ~24 tok/s @ 6k-tok prompt, ~26 tok/s prefix-cache replay) |
 
 ## Hardware tested
 
@@ -173,6 +175,41 @@ docker run --rm --gpus all --ipc=host \
   vllm-v100:latest \
   --enforce-eager \
   --no-enable-prefix-caching
+```
+
+### Quick run (Mistral-Small-4 119B Q4_K_M GGUF on 8x V100 32GB)
+
+Bartowski's GGUF for `mistralai/Mistral-Small-4-119B-2603`. `VLLM_MODEL`
+points at the first GGUF shard; `--tokenizer
+mistralai/Mistral-Small-4-119B-2603` (passed through `$@`) overrides the
+GGUF-embedded tokenizer with the HF one, which carries the official chat
+template that emits the
+`[MODEL_SETTINGS]{"reasoning_effort":"none"}[/MODEL_SETTINGS][INST]...[/INST]`
+envelope the model was trained on. Cudagraph capture engages -- do
+**not** add `--enforce-eager`. Prefix caching is supported (the LSE-SDPA
+fallback in `mla_attention.py` keeps `merge_attn_states` happy on V100).
+Local bench (TP=8, max_model_len=16384): ~82 tok/s decode on a short
+prompt, ~24 tok/s decode at 6k-token prompt + 512-token generation
+(chunked prefill on, `max_num_batched_tokens=2048`), ~26 tok/s decode on
+prefix-cache replay.
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/bartowski/mistralai_Mistral-Small-4-119B-2603-Q4_K_M/mistralai_Mistral-Small-4-119B-2603-Q4_K_M-00001-of-00002.gguf \
+  -e VLLM_SERVED_MODEL_NAME=Mistral-Small-4-119B-Q4_K_M \
+  -e VLLM_QUANTIZATION=gguf \
+  -e VLLM_DTYPE=float16 \
+  -e VLLM_TENSOR_PARALLEL_SIZE=8 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.70 \
+  -e VLLM_MAX_MODEL_LEN=16384 \
+  -e VLLM_MAX_NUM_SEQS=1 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
+  -p 8000:8000 \
+  vllm-v100:latest \
+  --tokenizer mistralai/Mistral-Small-4-119B-2603 \
+  --enable-prefix-caching
 ```
 
 ### Quick run (Qwen3.5-27B-AWQ on 2x V100)

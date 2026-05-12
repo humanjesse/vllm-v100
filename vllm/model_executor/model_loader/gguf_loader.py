@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import glob
 import os
 from collections.abc import Generator
 
 import gguf
+import numpy as np
 import regex as re
 import torch
 import torch.nn as nn
@@ -28,6 +30,181 @@ from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
+
+
+_GGUF_SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def _resolve_gguf_shards(model_name_or_path: str) -> list[str]:
+    """Return the list of GGUF shards for `model_name_or_path`.
+
+    GGUF "split" files are named ``<base>-NNNNN-of-MMMMM.gguf``. vLLM is
+    typically given the first shard; the remaining shards live next to it
+    in the same directory. For non-split files, returns a single-element
+    list with the original path.
+    """
+    base = os.path.basename(model_name_or_path)
+    m = _GGUF_SPLIT_RE.match(base)
+    if m is None:
+        return [model_name_or_path]
+    prefix, _, total = m.groups()
+    directory = os.path.dirname(model_name_or_path)
+    pattern = os.path.join(directory, f"{prefix}-*-of-{total}.gguf")
+    shards = sorted(glob.glob(pattern))
+    return shards if shards else [model_name_or_path]
+
+
+def _mistral4_moe_iterator(
+    gguf_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Synthesize per-expert ``gate_proj`` and ``up_proj`` qweights from the
+    fused ``ffn_gate_up_exps`` GGUF tensor.
+
+    Bartowski's Mistral4 GGUF ships the gate+up MoE projection FUSED into a
+    single quantized tensor ``blk.X.ffn_gate_up_exps.weight`` of physical
+    shape ``(num_experts, 2*intermediate, packed_hidden_bytes)``. vLLM's
+    ``GGUFMoEMethod`` materializes ``w13_qweight`` from two separate w1/w3
+    full loads (gate & up), so we split the fused bytes along axis=1 (rows
+    of the matrix — quant blocks pack along the innermost ``hidden`` axis,
+    so row-axis splits are byte-clean) and yield two qweight events per
+    layer plus matching ``qweight_type`` events. Convention follows HF
+    Mistral4: first half is gate, second half is up
+    (``gate_up_proj[:, :intermediate, :]`` = gate).
+
+    Yields ``qweight_type`` events first across all layers (per the
+    ``gguf_quant_weights_iterator`` convention) before any qweight events.
+    """
+    fused: list[tuple[int, gguf.ReaderTensor]] = []
+    for path in gguf_files:
+        reader = gguf.GGUFReader(path)
+        for t in reader.tensors:
+            if not t.name.startswith("blk."):
+                continue
+            if not t.name.endswith(".ffn_gate_up_exps.weight"):
+                continue
+            try:
+                layer_idx = int(t.name.split(".")[1])
+            except (IndexError, ValueError):
+                continue
+            fused.append((layer_idx, t))
+
+    fused.sort(key=lambda x: x[0])
+
+    # Pass 1: yield qweight_type for gate then up (same value).
+    for layer_idx, t in fused:
+        wt = torch.tensor(t.tensor_type)
+        for shard in ("gate_proj", "up_proj"):
+            name = (
+                f"model.layers.{layer_idx}.mlp.experts.0.{shard}.qweight_type"
+            )
+            yield name, wt
+
+    # Pass 2: yield qweight bytes for gate (rows [0:half)) then up
+    # (rows [half:end)) per layer.
+    for layer_idx, t in fused:
+        data = np.ascontiguousarray(t.data)  # (experts, 2*intermediate, bytes)
+        if data.ndim != 3:
+            raise RuntimeError(
+                f"Mistral4 ffn_gate_up_exps for layer {layer_idx} expected "
+                f"ndim=3, got {data.ndim} (shape={data.shape})"
+            )
+        mid = data.shape[1]
+        if mid % 2 != 0:
+            raise RuntimeError(
+                f"Mistral4 ffn_gate_up_exps middle dim {mid} must be even "
+                f"(layer {layer_idx})"
+            )
+        half = mid // 2
+        # Mistral4 transformers HF code does `gate, up = chunk(2, dim=-1)`
+        # after Linear, so first half = gate. llama.cpp's converter preserves
+        # this layout for the fused ffn_gate_up_exps tensor.
+        gate_bytes = data[:, :half, :]
+        up_bytes = data[:, half:, :]
+        # FusedMoE.weight_loader reads loaded_weight.shape so the input must
+        # be a torch tensor with the 3D shape; the kernel only sees the
+        # raw bytes.
+        for shard, slice_ in (("gate_proj", gate_bytes), ("up_proj", up_bytes)):
+            name = f"model.layers.{layer_idx}.mlp.experts.0.{shard}.qweight"
+            yield name, torch.from_numpy(np.ascontiguousarray(slice_))
+
+
+def _mistral4_kv_b_iterator(
+    gguf_files: list[str],
+    num_heads: int,
+    kv_lora: int,
+    qk_nope: int,
+    v_head: int,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Synthesize fused ``kv_b_proj.weight`` from split ``attn_k_b`` + ``attn_v_b``.
+
+    Bartowski's Mistral4 GGUFs ship the MLA K/V decompression already split
+    into two tensors per layer (``attn_k_b`` Q8_0, ``attn_v_b`` Q6_K), but
+    our model class wants a fused ``kv_b_proj`` matching the HF Linear
+    convention ``[num_heads*(qk_nope+v_head), kv_lora]`` with K rows first
+    per head, then V rows.
+
+    GGUF logical layout (gguf-py, innermost first):
+      attn_k_b: (qk_nope, kv_lora, heads) → memory: heads, kv_lora, qk_nope
+      attn_v_b: (kv_lora, v_head, heads)  → memory: heads, v_head, kv_lora
+
+    Merge per layer:
+      k = dequant(attn_k_b).reshape(heads, kv_lora, qk_nope).transpose(1,2)
+      v = dequant(attn_v_b).reshape(heads, v_head, kv_lora)
+      fused = cat([k, v], dim=1).reshape(heads*(qk_nope+v_head), kv_lora)
+    """
+    out_per_head = qk_nope + v_head
+    # Index by layer idx to pair k_b with v_b. Accumulate across ALL shards
+    # before pairing — gguf-split partitions on cumulative byte size, so a
+    # layer's attn_k_b and attn_v_b may land in different shards. Mirrors
+    # the cross-shard accumulation pattern in _mistral4_moe_iterator above.
+    k_b_tensors: dict[int, gguf.ReaderTensor] = {}
+    v_b_tensors: dict[int, gguf.ReaderTensor] = {}
+    for path in gguf_files:
+        reader = gguf.GGUFReader(path)
+        for t in reader.tensors:
+            if not t.name.startswith("blk."):
+                continue
+            parts = t.name.split(".")
+            try:
+                layer_idx = int(parts[1])
+            except (IndexError, ValueError):
+                continue
+            if t.name.endswith(".attn_k_b.weight"):
+                k_b_tensors[layer_idx] = t
+            elif t.name.endswith(".attn_v_b.weight"):
+                v_b_tensors[layer_idx] = t
+    for layer_idx in sorted(k_b_tensors):
+        if layer_idx not in v_b_tensors:
+            logger.warning(
+                "Mistral4 GGUF layer %d has attn_k_b but no attn_v_b; "
+                "skipping kv_b_proj synthesis (kv_b_proj will remain "
+                "uninitialized).",
+                layer_idx,
+            )
+            continue
+        t_k = k_b_tensors[layer_idx]
+        t_v = v_b_tensors[layer_idx]
+        from vllm import _custom_ops as _ops
+
+        k_data = torch.from_numpy(np.ascontiguousarray(t_k.data)).cuda()
+        v_data = torch.from_numpy(np.ascontiguousarray(t_v.data)).cuda()
+        k_dq = _ops.ggml_dequantize(
+            k_data, int(t_k.tensor_type), num_heads * kv_lora, qk_nope,
+            torch.float16,
+        )
+        v_dq = _ops.ggml_dequantize(
+            v_data, int(t_v.tensor_type), num_heads * v_head, kv_lora,
+            torch.float16,
+        )
+        k_b = k_dq.view(num_heads, kv_lora, qk_nope).transpose(1, 2)
+        v_b = v_dq.view(num_heads, v_head, kv_lora)
+        fused = torch.cat([k_b, v_b], dim=1).contiguous()
+        fused = fused.view(num_heads * out_per_head, kv_lora).cpu()
+        del k_data, v_data, k_dq, v_dq, k_b, v_b
+        yield (
+            f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight",
+            fused,
+        )
 
 
 class GGUFModelLoader(BaseModelLoader):
@@ -139,6 +316,37 @@ class GGUFModelLoader(BaseModelLoader):
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
                     f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
+                sideload_params.append(
+                    re.compile(
+                        f"model\\.layers\\.{idx}"
+                        r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                    )
+                )
+        if model_type == "mistral4":
+            # Mistral4 ships a Mistral4Config + Mistral4ForCausalLM in
+            # transformers, but Mistral4ForCausalLM is not in the
+            # AutoModelForCausalLM registry (HF intends it to be wrapped by
+            # Mistral3ForConditionalGeneration). For text-only GGUF (Bartowski
+            # strips the wrapper, so model_type == "mistral4" at the top
+            # level), register it explicitly so from_config() below resolves.
+            try:
+                from transformers import Mistral4Config, Mistral4ForCausalLM
+                AutoModelForCausalLM.register(
+                    Mistral4Config, Mistral4ForCausalLM, exist_ok=True
+                )
+            except (ImportError, ValueError):
+                pass
+            # MoE expert tensors. Bartowski's GGUF stores ffn_down_exps as a
+            # single 3D tensor, and (unlike deepseek2) ships gate+up FUSED as
+            # ffn_gate_up_exps. Map ffn_down_exps to expert 0's down_proj
+            # (FusedMoE.weight_loader detects ndim==3 and full-loads all
+            # experts at once). The fused gate_up tensor is split into
+            # synthesized gate / up qweights by `_mistral4_moe_iterator`,
+            # so it has no entry here.
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
                 )
                 sideload_params.append(
                     re.compile(
@@ -308,6 +516,14 @@ class GGUFModelLoader(BaseModelLoader):
         - Main file (gemma-3-*.gguf): Language model weights (model.*)
         - mmproj file (mmproj*.gguf): Vision tower + projector weights (v.*, mm.*)
 
+        For split GGUF files (``*-NNNNN-of-MMMMM.gguf``), iterates over all
+        sibling shards in the same directory.
+
+        For Mistral4 GGUFs (Bartowski layout), prepends a synthesizer that
+        builds a fused ``kv_b_proj.weight`` from per-layer ``attn_k_b`` +
+        ``attn_v_b`` pairs (the upstream gguf-py mapping points at
+        ``attn_kv_b`` which Bartowski never writes).
+
         Yields:
             Tuples of (parameter_name, tensor) for all model weights
         """
@@ -322,7 +538,23 @@ class GGUFModelLoader(BaseModelLoader):
             )
             yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
 
-        yield from gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        shards = _resolve_gguf_shards(model_name_or_path)
+        if len(shards) > 1:
+            logger.info("Loading GGUF model from %d shards: %s",
+                        len(shards), [os.path.basename(s) for s in shards])
+
+        if hf_config.model_type == "mistral4":
+            yield from _mistral4_kv_b_iterator(
+                shards,
+                num_heads=hf_config.num_attention_heads,
+                kv_lora=hf_config.kv_lora_rank,
+                qk_nope=hf_config.qk_nope_head_dim,
+                v_head=hf_config.v_head_dim,
+            )
+            yield from _mistral4_moe_iterator(shards)
+
+        for shard in shards:
+            yield from gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
@@ -340,15 +572,23 @@ class GGUFModelLoader(BaseModelLoader):
         device_config = vllm_config.device_config
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
+
+        # Resolve all shards (single file → [path]; split file → all siblings).
+        shards = _resolve_gguf_shards(local_model_path)
+        # tie_word_embeddings: lm_head must be missing across ALL shards, not
+        # just the first one (would otherwise wrongly tie when lm_head lives
+        # in a later shard).
+        all_extra: set[str] = set(gguf_weights_map.values())
+        for shard in shards:
+            all_extra &= set(get_gguf_extra_tensor_names(shard, gguf_weights_map))
+        if "lm_head.weight" in all_extra:
             model_config.hf_config.update({"tie_word_embeddings": True})
 
-        weight_type_map = self._get_gguf_weight_type(
-            model_config, local_model_path, gguf_weights_map
-        )
+        weight_type_map: dict[str, str] = {}
+        for shard in shards:
+            weight_type_map.update(
+                self._get_gguf_weight_type(model_config, shard, gguf_weights_map)
+            )
         # filter out unquantized modules to skip
         unquant_names = [
             name.removesuffix(".weight")
