@@ -18,9 +18,6 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | Model | Params | Quant | Architecture | TP | Status |
 |-------|--------|-------|-------------|---:|--------|
 | [cyankiwi/MiniMax-M2.7-AWQ-4bit](https://huggingface.co/cyankiwi/MiniMax-M2.7-AWQ-4bit) | 240B (11B active) | compressed-tensors W4A16 | MoE (256 experts) | 8 | Working |
-| [tclf90/Qwen3.5-27B-AWQ](https://huggingface.co/tclf90/Qwen3.5-27B-AWQ) | 27B | AWQ | Dense | 2-4 | Working (1Cat-validated) |
-| [tclf90/Qwen3.5-35B-A3B-AWQ](https://huggingface.co/tclf90/Qwen3.5-35B-A3B-AWQ) | 35B (3B active) | AWQ | MoE | 2-4 | Working (1Cat-validated) |
-| [tclf90/Qwen3.5-122B-A10B-AWQ](https://huggingface.co/tclf90/Qwen3.5-122B-A10B-AWQ) | 122B (10B active) | AWQ | MoE | 4+ | Working (1Cat-validated) |
 | [cyankiwi/Qwen3.6-27B-AWQ-INT4](https://huggingface.co/cyankiwi/Qwen3.6-27B-AWQ-INT4) | 27B | compressed-tensors W4A16 (asymmetric) | Hybrid Gated DeltaNet | 4 | Working (greedy + tool-calling smoke) |
 | [cyankiwi/granite-4.1-8b-AWQ-INT4](https://huggingface.co/cyankiwi/granite-4.1-8b-AWQ-INT4) | 8B | compressed-tensors W4A16 group_size=32 (asymmetric) | Dense (GraniteForCausalLM) | 2 | Working (cudagraph; ~127 tok/s single-stream, ~587 tok/s aggregate batch=8) |
 | [Intel/DeepSeek-V4-Flash-W4A16-AutoRound](https://huggingface.co/Intel/DeepSeek-V4-Flash-W4A16-AutoRound) | 290B (37B active) | auto-round W4A16 | MoE (256 experts) + MLA + sparse-attn + Hyper-Connections | 8 | Working (single-request, ~5.66 tok/s decode-only) |
