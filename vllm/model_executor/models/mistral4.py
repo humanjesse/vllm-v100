@@ -213,6 +213,18 @@ class Mistral4MoE(nn.Module):
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+        # Init-time read of fp16 sanitization knobs. Read once so torch.compile
+        # / cudagraph captures the chosen branch as a constant instead of
+        # graph-breaking on a per-forward env read.
+        self._moe_nan2num = os.environ.get("MISTRAL4_MOE_NAN2NUM") == "1"
+        _moe_clamp_str = os.environ.get("MISTRAL4_MOE_CLAMP")
+        try:
+            self._moe_clamp: float | None = (
+                float(_moe_clamp_str) if _moe_clamp_str else None
+            )
+        except ValueError:
+            self._moe_clamp = None
+
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
@@ -300,20 +312,12 @@ class Mistral4MoE(nn.Module):
         # 4096→128; with input_max≈54 and weight outliers the matmul
         # accumulator can exceed fp16 max → router_logits Inf → softmax NaN
         # → cascades through all expert outputs. Sanitize the input here.
-        if (
-            os.environ.get("MISTRAL4_MOE_NAN2NUM") == "1"
-            and hidden_states.dtype == torch.float16
-        ):
+        if self._moe_nan2num and hidden_states.dtype == torch.float16:
             hidden_states = torch.nan_to_num(
                 hidden_states, nan=0.0, posinf=65504.0, neginf=-65504.0
             )
-        moe_clamp_str = os.environ.get("MISTRAL4_MOE_CLAMP")
-        if moe_clamp_str and hidden_states.dtype == torch.float16:
-            try:
-                moe_clamp_val = float(moe_clamp_str)
-                hidden_states = hidden_states.clamp(-moe_clamp_val, moe_clamp_val)
-            except ValueError:
-                pass
+        if self._moe_clamp is not None and hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clamp(-self._moe_clamp, self._moe_clamp)
 
         if self.experts.is_internal_router:
             fused_moe_out = self.experts(
@@ -334,10 +338,12 @@ class Mistral4MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         else:
             # V100 fp16 overflow guard — see MISTRAL4_FP16_RES_SCALE comment
-            # at the top of this file. Mistral4's routed_scaling_factor is
-            # 1.0 by default, so this guard is unconditional in fp16 (the
-            # DSv2-style "scale != 1.0" gate doesn't apply here).
-            inv = 1.0 / MISTRAL4_FP16_RES_SCALE
+            # at the top of this file. Fold routed_scaling_factor into the
+            # residual-scale divisor so the fp16 path stays algebraically
+            # equivalent to the bf16 branch (the 119B ships
+            # routed_scaling_factor=1.0, but smaller Mistral4 variants may
+            # ship with a different factor — Mistral4MLP is kept for them).
+            inv = self.routed_scaling_factor / MISTRAL4_FP16_RES_SCALE
             final_hidden_states *= inv
             if shared_output is not None:
                 shared_output *= inv
@@ -483,9 +489,18 @@ class Mistral4MLAAttention(nn.Module):
 
         # Mistral4 always rope_type=yarn. Map to vLLM's "deepseek_yarn"
         # implementation which already implements the correct YARN variant.
+        # Whitelist explicitly — any other non-default rope_type would silently
+        # mis-load on a future variant (wrong rotary frequencies + wrong YARN
+        # mscale would produce coherent-looking but wrong outputs).
         rope_parameters = dict(config.rope_parameters)
-        if rope_parameters.get("rope_type", "default") != "default":
+        _rope_type = rope_parameters.get("rope_type", "default")
+        if _rope_type == "yarn":
             rope_parameters["rope_type"] = "deepseek_yarn"
+        elif _rope_type != "default":
+            raise NotImplementedError(
+                f"Mistral4 rope_type {_rope_type!r} not supported; only "
+                "'yarn' is mapped to deepseek_yarn here."
+            )
         # Strip Mistral4-specific keys vLLM's get_rope doesn't understand.
         rope_parameters.pop("llama_4_scaling_beta", None)
         # `partial_rotary_factor` is set by Mistral4Config to
@@ -545,6 +560,18 @@ class Mistral4MLAAttention(nn.Module):
             prefix,
         )
 
+        # Init-time read of fp16 sanitization knobs. Read once so torch.compile
+        # / cudagraph captures the chosen branch as a constant instead of
+        # graph-breaking on a per-forward env read.
+        self._attn_nan2num = os.environ.get("MISTRAL4_ATTN_NAN2NUM", "1") != "0"
+        _attn_clamp_str = os.environ.get("MISTRAL4_ATTN_CLAMP")
+        try:
+            self._attn_clamp: float | None = (
+                float(_attn_clamp_str) if _attn_clamp_str else None
+            )
+        except ValueError:
+            self._attn_clamp = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -563,20 +590,12 @@ class Mistral4MLAAttention(nn.Module):
         # overflowed to Inf and its layernorm cascaded to NaN, the next
         # layer would propagate NaN forever. Replace non-finite values
         # so each layer's residual stream has a finite starting point.
-        if (
-            os.environ.get("MISTRAL4_ATTN_NAN2NUM", "1") != "0"
-            and hidden_states.dtype == torch.float16
-        ):
+        if self._attn_nan2num and hidden_states.dtype == torch.float16:
             hidden_states = torch.nan_to_num(
                 hidden_states, nan=0.0, posinf=65504.0, neginf=-65504.0
             )
-        clamp_str = os.environ.get("MISTRAL4_ATTN_CLAMP")
-        if clamp_str and hidden_states.dtype == torch.float16:
-            try:
-                clamp_val = float(clamp_str)
-                hidden_states = hidden_states.clamp(-clamp_val, clamp_val)
-            except ValueError:
-                pass
+        if self._attn_clamp is not None and hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clamp(-self._attn_clamp, self._attn_clamp)
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
 
@@ -828,6 +847,11 @@ class Mistral4ForCausalLM(
         self.fuse_qkv_a_proj = (
             getattr(config, "q_lora_rank", None) is not None
         )
+        # Snapshot the class-level packed_modules_mapping into an instance
+        # attribute before mutating so a first non-fuse instance doesn't
+        # permanently strip the entry from the class dict for every
+        # subsequent instance in the process (matches the qwen3_5.py pattern).
+        self.packed_modules_mapping = dict(type(self).packed_modules_mapping)
         if not self.fuse_qkv_a_proj:
             # No Q-LoRA — drop the fused_qkv_a_proj packing entry.
             self.packed_modules_mapping.pop("fused_qkv_a_proj", None)

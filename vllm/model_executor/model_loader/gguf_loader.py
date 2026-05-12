@@ -153,11 +153,14 @@ def _mistral4_kv_b_iterator(
       fused = cat([k, v], dim=1).reshape(heads*(qk_nope+v_head), kv_lora)
     """
     out_per_head = qk_nope + v_head
+    # Index by layer idx to pair k_b with v_b. Accumulate across ALL shards
+    # before pairing — gguf-split partitions on cumulative byte size, so a
+    # layer's attn_k_b and attn_v_b may land in different shards. Mirrors
+    # the cross-shard accumulation pattern in _mistral4_moe_iterator above.
+    k_b_tensors: dict[int, gguf.ReaderTensor] = {}
+    v_b_tensors: dict[int, gguf.ReaderTensor] = {}
     for path in gguf_files:
         reader = gguf.GGUFReader(path)
-        # Index by layer idx to pair k_b with v_b
-        k_b_tensors: dict[int, gguf.ReaderTensor] = {}
-        v_b_tensors: dict[int, gguf.ReaderTensor] = {}
         for t in reader.tensors:
             if not t.name.startswith("blk."):
                 continue
@@ -170,38 +173,38 @@ def _mistral4_kv_b_iterator(
                 k_b_tensors[layer_idx] = t
             elif t.name.endswith(".attn_v_b.weight"):
                 v_b_tensors[layer_idx] = t
-        for layer_idx in sorted(k_b_tensors):
-            if layer_idx not in v_b_tensors:
-                logger.warning(
-                    "Mistral4 GGUF layer %d has attn_k_b but no attn_v_b; "
-                    "skipping kv_b_proj synthesis (kv_b_proj will remain "
-                    "uninitialized).",
-                    layer_idx,
-                )
-                continue
-            t_k = k_b_tensors[layer_idx]
-            t_v = v_b_tensors[layer_idx]
-            from vllm import _custom_ops as _ops
+    for layer_idx in sorted(k_b_tensors):
+        if layer_idx not in v_b_tensors:
+            logger.warning(
+                "Mistral4 GGUF layer %d has attn_k_b but no attn_v_b; "
+                "skipping kv_b_proj synthesis (kv_b_proj will remain "
+                "uninitialized).",
+                layer_idx,
+            )
+            continue
+        t_k = k_b_tensors[layer_idx]
+        t_v = v_b_tensors[layer_idx]
+        from vllm import _custom_ops as _ops
 
-            k_data = torch.from_numpy(np.ascontiguousarray(t_k.data)).cuda()
-            v_data = torch.from_numpy(np.ascontiguousarray(t_v.data)).cuda()
-            k_dq = _ops.ggml_dequantize(
-                k_data, int(t_k.tensor_type), num_heads * kv_lora, qk_nope,
-                torch.float16,
-            )
-            v_dq = _ops.ggml_dequantize(
-                v_data, int(t_v.tensor_type), num_heads * v_head, kv_lora,
-                torch.float16,
-            )
-            k_b = k_dq.view(num_heads, kv_lora, qk_nope).transpose(1, 2)
-            v_b = v_dq.view(num_heads, v_head, kv_lora)
-            fused = torch.cat([k_b, v_b], dim=1).contiguous()
-            fused = fused.view(num_heads * out_per_head, kv_lora).cpu()
-            del k_data, v_data, k_dq, v_dq, k_b, v_b
-            yield (
-                f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight",
-                fused,
-            )
+        k_data = torch.from_numpy(np.ascontiguousarray(t_k.data)).cuda()
+        v_data = torch.from_numpy(np.ascontiguousarray(t_v.data)).cuda()
+        k_dq = _ops.ggml_dequantize(
+            k_data, int(t_k.tensor_type), num_heads * kv_lora, qk_nope,
+            torch.float16,
+        )
+        v_dq = _ops.ggml_dequantize(
+            v_data, int(t_v.tensor_type), num_heads * v_head, kv_lora,
+            torch.float16,
+        )
+        k_b = k_dq.view(num_heads, kv_lora, qk_nope).transpose(1, 2)
+        v_b = v_dq.view(num_heads, v_head, kv_lora)
+        fused = torch.cat([k_b, v_b], dim=1).contiguous()
+        fused = fused.view(num_heads * out_per_head, kv_lora).cpu()
+        del k_data, v_data, k_dq, v_dq, k_b, v_b
+        yield (
+            f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight",
+            fused,
+        )
 
 
 class GGUFModelLoader(BaseModelLoader):

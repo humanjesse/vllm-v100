@@ -124,8 +124,11 @@ static __device__ __forceinline__ void moe_q(
         continue;
       }
       // V100 fp16 overflow guard: see moe_vec.cuh.
-      const float s = sum[i / WARP_SIZE_GGUF][j / nwarps];
-      dst[col_dst * nrows_dst + row_dst] = fminf(fmaxf(s, -65504.0f), 65504.0f);
+      float s = sum[i / WARP_SIZE_GGUF][j / nwarps];
+      if constexpr (std::is_same_v<scalar_t, half>) {
+        s = fminf(fmaxf(s, -65504.0f), 65504.0f);
+      }
+      dst[col_dst * nrows_dst + row_dst] = s;
     }
   }
 }

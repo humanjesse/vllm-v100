@@ -51,7 +51,12 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
     // V100 fp16 overflow guard: clamp fp32 accumulator to fp16 range before
     // implicit cast. Avoids Inf cascade through downstream silu/down-proj on
     // Mistral4 deep layers (post_attn_ln max ~55 × Q4_K weight outliers).
-    dst[blockIdx.z * nrows + row] = fminf(fmaxf(tmp, -65504.0f), 65504.0f);
+    // Only gated on the half instantiation — bf16/fp32 dst dtypes have far
+    // larger range and the clamp would truncate valid values.
+    if constexpr (std::is_same_v<scalar_t, half>) {
+      tmp = fminf(fmaxf(tmp, -65504.0f), 65504.0f);
+    }
+    dst[blockIdx.z * nrows + row] = tmp;
   }
 }
 
