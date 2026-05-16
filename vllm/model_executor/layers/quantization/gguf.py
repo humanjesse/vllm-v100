@@ -285,11 +285,28 @@ def _fused_moe_gguf(
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
     out_hidden_states = torch.empty_like(x)
+    # MMQ requires ncols-x alignment per quant type — the dense
+    # `_fused_mul_mat_gguf` path gates on this via _MMQ_NCOLS_X_ALIGNMENT, but
+    # the MoE path didn't, so unaligned w2-input (e.g. MiMo-V2.5 Q3_K_M with
+    # moe_intermediate=2048, TP=8 → 256 per rank, Q3_K wants 512) read OOB
+    # scales and IMA-crashed once x.shape[0] crossed the >64 MMQ threshold.
+    # Apply the same alignment gate here: w1 sees x.shape[1] as ncols, w2
+    # sees w1's per-expert output cols (w1.shape[1] // 2 after SwiGLU).
+    mmq_align_w1 = _MMQ_NCOLS_X_ALIGNMENT.get(qweight_type, 0)
+    mmq_align_w2 = _MMQ_NCOLS_X_ALIGNMENT.get(qweight_type2, 0)
+    w2_in_dim = w1.shape[1] // 2
+    mmq_safe = (
+        mmq_align_w1 > 0
+        and mmq_align_w2 > 0
+        and x.shape[1] % mmq_align_w1 == 0
+        and w2_in_dim % mmq_align_w2 == 0
+    )
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES
         and x.shape[0] > 64
+        and mmq_safe
     ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
