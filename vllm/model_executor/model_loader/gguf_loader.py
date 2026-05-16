@@ -207,6 +207,130 @@ def _mistral4_kv_b_iterator(
         )
 
 
+def _mimo2_attn_qkv_iterator(
+    gguf_files: list[str],
+    hf_config,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Split fused ``attn_qkv`` into per-shard q_proj / k_proj / v_proj.
+
+    Bartowski's MiMo-V2.5 GGUF ships each layer's QKV projection as a
+    single fused ``blk.X.attn_qkv.weight`` tensor (HF "Pro" layout). vLLM's
+    QKVParallelLinear, when GGUF-quantized, keeps a 3-element
+    ``qweight_type`` vector keyed by shard_id ∈ {"q","k","v"} — so the
+    fused tensor cannot be loaded with ``default_weight_loader``. We slice
+    along output dim 0 (each row = one output feature, so the cut is row-
+    aligned in the quantized byte layout) and yield three sub-tensors
+    that the model's stacked_params_mapping then fans back into
+    ``qkv_proj``.
+
+    Sizes are layer-dependent because hybrid_layer_pattern == 1 (SWA)
+    uses different KV head counts than full-attention layers.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = get_tensor_model_parallel_world_size()
+    head_dim_full = hf_config.head_dim
+    v_head_dim_full = hf_config.v_head_dim
+    num_heads_full = hf_config.num_attention_heads
+    num_kv_heads_full = hf_config.num_key_value_heads
+    head_dim_swa = hf_config.swa_head_dim
+    v_head_dim_swa = getattr(hf_config, "swa_v_head_dim", head_dim_swa)
+    num_heads_swa = hf_config.swa_num_attention_heads
+    num_kv_heads_swa = hf_config.swa_num_key_value_heads
+    pattern = list(getattr(hf_config, "hybrid_layer_pattern", []))
+
+    def layer_dims(layer_idx: int):
+        """Return (nh, nkv, head_dim, v_head_dim) for this layer."""
+        kind = pattern[layer_idx] if layer_idx < len(pattern) else 0
+        if kind == 1:  # SWA
+            return (num_heads_swa, num_kv_heads_swa, head_dim_swa, v_head_dim_swa)
+        return (
+            num_heads_full,
+            num_kv_heads_full,
+            head_dim_full,
+            v_head_dim_full,
+        )
+
+    # Index attn_qkv tensors by layer across all shards (gguf-split can
+    # land different layers' tensors in different shards). Bartowski's
+    # MiMo-V2.5 GGUF carries `nextn_predict_layers` (MTP) trailing blocks
+    # past num_hidden_layers; we don't load those (our model class is
+    # text-only), so cap on hf_config.num_hidden_layers.
+    num_text_layers = hf_config.num_hidden_layers
+    qkv_tensors: dict[int, gguf.ReaderTensor] = {}
+    for path in gguf_files:
+        reader = gguf.GGUFReader(path)
+        for t in reader.tensors:
+            if not t.name.endswith(".attn_qkv.weight"):
+                continue
+            parts = t.name.split(".")
+            try:
+                layer_idx = int(parts[1])
+            except (IndexError, ValueError):
+                continue
+            if layer_idx >= num_text_layers:
+                continue
+            qkv_tensors[layer_idx] = t
+
+    # Pass 1: yield all qweight_type scalars first (matches the contract of
+    # gguf_quant_weights_iterator — packed-layer loaders need types before
+    # data so each shard slot has its type recorded before kernel selection).
+    for layer_idx in sorted(qkv_tensors):
+        t = qkv_tensors[layer_idx]
+        wtype = t.tensor_type
+        if wtype.name in ("F32", "BF16", "F16"):
+            continue
+        base = f"model.layers.{layer_idx}.self_attn"
+        wtype_tensor = torch.tensor(wtype)
+        for sub in ("q_proj", "k_proj", "v_proj"):
+            yield (f"{base}.{sub}.qweight_type", wtype_tensor)
+
+    # Pass 2: split the data along dim 0 and yield qweight (quantized) or
+    # weight (unquantized) sub-tensors. When num_kv_heads < tp_size,
+    # vLLM's GGUF weight_loader for QKVParallelLinear divides naively by
+    # tp_size (no per-head replication), so we have to pre-replicate K/V
+    # rows along dim 0 — each KV head appears num_kv_head_replicas times
+    # consecutively, matching the replica layout the non-GGUF path bakes
+    # into QKVParallelLinear (rank → kv_head_idx via tp_rank // replicas).
+    for layer_idx in sorted(qkv_tensors):
+        t = qkv_tensors[layer_idx]
+        wtype = t.tensor_type
+        nh, nkv, hd, vhd = layer_dims(layer_idx)
+        q_size, k_size, v_size = nh * hd, nkv * hd, nkv * vhd
+        out_rows = int(t.data.shape[0])
+        expected = q_size + k_size + v_size
+        assert out_rows == expected, (
+            f"layer {layer_idx}: attn_qkv has {out_rows} output rows but "
+            f"hf_config implies q+k+v = {expected}"
+        )
+        tdata = torch.from_numpy(np.ascontiguousarray(t.data))
+        suffix = (
+            "weight" if wtype.name in ("F32", "BF16", "F16") else "qweight"
+        )
+        base = f"model.layers.{layer_idx}.self_attn"
+        q_part = tdata[:q_size]
+        k_part = tdata[q_size : q_size + k_size]
+        v_part = tdata[q_size + k_size :]
+        replicas = max(1, tp_size // nkv)
+        if replicas > 1:
+            packed_in = tdata.shape[-1]
+            k_part = (
+                k_part.view(nkv, hd, packed_in)
+                .repeat_interleave(replicas, dim=0)
+                .contiguous()
+                .view(nkv * replicas * hd, packed_in)
+            )
+            v_part = (
+                v_part.view(nkv, vhd, packed_in)
+                .repeat_interleave(replicas, dim=0)
+                .contiguous()
+                .view(nkv * replicas * vhd, packed_in)
+            )
+        yield (f"{base}.q_proj.{suffix}", q_part)
+        yield (f"{base}.k_proj.{suffix}", k_part)
+        yield (f"{base}.v_proj.{suffix}", v_part)
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -308,6 +432,52 @@ class GGUFModelLoader(BaseModelLoader):
             # GGUF layer map assumes that we will have a merged expert weights
             # so we need to map them manually
             for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
+                sideload_params.append(
+                    re.compile(
+                        f"model\\.layers\\.{idx}"
+                        r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                    )
+                )
+        if model_type == "mimo_v2":
+            # gguf-py uses arch name "mimo2"; HF model_type is "mimo_v2".
+            model_type = "mimo2"
+            # Bartowski's MiMo-V2.5 GGUF ships attn_qkv FUSED but
+            # QKVParallelLinear's GGUF buffers expect shard_id-aware loading
+            # (qweight_type is a 3-element vector keyed by Q/K/V). We split
+            # the fused tensor in `_mimo2_attn_qkv_iterator` and yield it as
+            # q_proj / k_proj / v_proj so the model's stacked_params_mapping
+            # fans them back into qkv_proj. The HF dummy model exposes a
+            # single qkv_proj.weight (HF Pro layout); register a sideload
+            # pattern so the unmapped-param check ignores it.
+            sideload_params.append(
+                re.compile(r"model\.layers\.[0-9]+\.self_attn\.qkv_proj\.weight")
+            )
+            # Layer 0 is a dense MLP (ffn_gate / ffn_up / ffn_down — the
+            # default name map handles these). Layers 1..N-1 are MoE.
+            # attention_sink_bias is an nn.Parameter (no .weight suffix in
+            # the HF state_dict), which trips find_hf_name_in_tensor_map's
+            # trailing-dot bug. Override explicitly for every layer that
+            # carries a sink in the hybrid pattern (1 = SWA layer).
+            for idx, kind in enumerate(
+                getattr(text_config, "hybrid_layer_pattern", [])
+            ):
+                if kind == 1:
+                    gguf_to_hf_name_map[f"blk.{idx}.attn_sinks.weight"] = (
+                        f"model.layers.{idx}.self_attn.attention_sink_bias"
+                    )
+            for idx in range(1, config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.exp_probs_b.bias"] = (
+                    f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
+                )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
                     f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
                 )
@@ -489,7 +659,10 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = get_gguf_weight_type_map(
             model_name_or_path, gguf_to_hf_name_map
         )
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        is_multimodal = (
+            hasattr(model_config.hf_config, "vision_config")
+            and model_config.hf_config.vision_config is not None
+        )
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -528,7 +701,10 @@ class GGUFModelLoader(BaseModelLoader):
             Tuples of (parameter_name, tensor) for all model weights
         """
         hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
+        is_multimodal = (
+            hasattr(hf_config, "vision_config")
+            and hf_config.vision_config is not None
+        )
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
@@ -552,6 +728,9 @@ class GGUFModelLoader(BaseModelLoader):
                 v_head=hf_config.v_head_dim,
             )
             yield from _mistral4_moe_iterator(shards)
+
+        if hf_config.model_type == "mimo_v2":
+            yield from _mimo2_attn_qkv_iterator(shards, hf_config)
 
         for shard in shards:
             yield from gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)

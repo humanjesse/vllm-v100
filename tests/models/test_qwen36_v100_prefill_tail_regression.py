@@ -132,6 +132,7 @@ def _run_backend(backend, prompts_by_len):
         attention_backend=backend,
         limit_mm_per_prompt={"image": 0, "video": 0},
         skip_mm_profiling=True,
+        kv_cache_auto_trim_ratio=0,
     )
     print(f"    load took {time.time() - t0:.1f}s", flush=True)
 

@@ -815,6 +815,11 @@ at::Tensor flash_attention_prefill_paged(
                 q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
                 seq_lens, softmax_scale, true, stream);
             break;
+        case 192:
+            launcher_flash_attention_forward_paged<192>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
+                seq_lens, softmax_scale, true, stream);
+            break;
         case 256:
             launcher_flash_attention_forward_paged<256>(
                 q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
