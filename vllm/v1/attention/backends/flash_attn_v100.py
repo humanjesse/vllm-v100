@@ -520,4 +520,4 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # Flash Attention V100 requires head_dim % 8 == 0.
-        return [64, 80, 96, 112, 128, 256]
+        return [64, 80, 96, 112, 128, 192, 256]

@@ -505,14 +505,14 @@ def maybe_override_with_speculators(
     Returns:
         Tuple of (resolved_model, resolved_tokenizer, speculative_config)
     """
-    if check_gguf_file(model):
-        kwargs["gguf_file"] = Path(model).name
-        gguf_model_repo = Path(model).parent
-    elif is_remote_gguf(model):
-        repo_id, _ = split_remote_gguf(model)
-        gguf_model_repo = Path(repo_id)
-    else:
-        gguf_model_repo = None
+    # GGUF files never carry a speculators_config field, and reading them
+    # forces transformers' load_gguf_checkpoint path (which has its own
+    # narrow architecture allowlist — e.g. it rejects mimo2). Short-circuit
+    # speculator detection for GGUF.
+    if check_gguf_file(model) or is_remote_gguf(model):
+        return model, tokenizer, vllm_speculative_config
+
+    gguf_model_repo = None
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
     config_dict, _ = PretrainedConfig.get_config_dict(
         model if gguf_model_repo is None else gguf_model_repo,
