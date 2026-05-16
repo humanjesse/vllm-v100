@@ -12,6 +12,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 - **`_DEFAULT_MAX_TOKENS` naming fix** -- alias for renamed constant that broke the CT MoE import chain
 - **DeepSeek-V4-Flash on V100** -- runnable model class for Intel's W4A16 AutoRound quant of V4-Flash (290B / ~37B active, 256 experts, MLA + sparse attention + Hyper-Connections). Includes a V100 fp16 sparse-attention kernel port, a `_hc_post` clamp that prevents fp16 residual overflow at pos 0, an Obstacle-1 CPU-mirror `start_pos` in attention metadata that drops the per-forward host sync, and a paged main-window KV cache (single-request scope; multi-request via paged compressor/indexer caches is the natural Stage-2 follow-up).
 - **Mistral-Small-4 119B GGUF on V100** -- runnable model class for Bartowski's Q4_K_M GGUF of Mistral-Small-4-119B-2603 (MoE, MLA, fused `ffn_gate_up_exps` + split `attn_k_b`/`attn_v_b` tensor layouts). Ships with three latent fixes that affect any GGUF or MLA user on V100: a 4-site fp16 overflow clamp in the GGUF csrc kernels (kept kernels' internal fp32 accumulator, clamped to ±65504 at the implicit fp32→fp16 write-back), an MMQ kernel alignment dispatch in `gguf.py` (small dense models like Qwen2.5-0.5B with hidden=896 now correctly fall back to dequantize instead of reading past the qweight buffer), and a manual fp32 LSE-returning fallback in `mla_attention.py` so MLA models with prefix caching / chunked prefill no longer crash `merge_attn_states` on V100.
+- **MiMo-V2.5 310B GGUF on V100** -- runnable model class for Bartowski's Q3_K_M GGUF of XiaomiMiMo/MiMo-V2.5 (310B / 15B active, hybrid SWA + full attention with asymmetric head dims Q/K=192 / V=128, fused `attn_qkv` + 3D `ffn_*_exps` tensor layouts, MTP blocks that we skip). Ships with two additional fixes that affect any V100 user, not just MiMo: an HDIM=192 template instantiation in the `flash_attn_v100` kernels (was only 64/80/96/112/128/256 before -- any model with head_dim=192 hit the default-case TORCH_CHECK), and an MMQ alignment guard mirrored from the dense path into `_fused_moe_gguf` (MoE models with K-quant experts whose per-rank `w2-input` isn't aligned silently IMA-crashed once batch crossed the MMVQ→MMQ threshold). Also pins `triton==3.5.1` in `requirements/cuda.txt` to match torch 2.9.1+cu128's wheel metadata, since triton 3.6.0's MLA decode codegen is ~3× slower on V100 sm_70 at long context (verified on Mistral4 T2 stress: 23.5 → 9.4 tok/s with 3.6.0, restored with the pin).
 
 ## Verified models
 
@@ -22,6 +23,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | [cyankiwi/granite-4.1-8b-AWQ-INT4](https://huggingface.co/cyankiwi/granite-4.1-8b-AWQ-INT4) | 8B | compressed-tensors W4A16 group_size=32 (asymmetric) | Dense (GraniteForCausalLM) | 2 | Working (cudagraph; ~127 tok/s single-stream, ~587 tok/s aggregate batch=8) |
 | [Intel/DeepSeek-V4-Flash-W4A16-AutoRound](https://huggingface.co/Intel/DeepSeek-V4-Flash-W4A16-AutoRound) | 290B (37B active) | auto-round W4A16 | MoE (256 experts) + MLA + sparse-attn + Hyper-Connections | 8 | Working (single-request, ~5.66 tok/s decode-only) |
 | [bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF) (Q4_K_M) | 119B | GGUF Q4_K_M | MoE + MLA (`Mistral4ForCausalLM`) | 8 | Working (cudagraph; ~82 tok/s short prompt, ~24 tok/s @ 6k-tok prompt, ~26 tok/s prefix-cache replay) |
+| [bartowski/MiMo-V2.5-GGUF](https://huggingface.co/bartowski/MiMo-V2.5-GGUF) (Q3_K_M) | 310B (15B active) | GGUF Q3_K_M | MoE + hybrid SWA + asymmetric head_dim (`MiMoV2FlashForCausalLM`) | 8 | Working (cudagraph; ~42 tok/s single-stream, ~64 tok/s aggregate batch=8) |
 
 ## Hardware tested
 
@@ -207,6 +209,49 @@ docker run --rm --gpus all --ipc=host \
   vllm-v100:latest \
   --tokenizer mistralai/Mistral-Small-4-119B-2603 \
   --enable-prefix-caching
+```
+
+### Quick run (MiMo-V2.5 310B Q3_K_M GGUF on 8x V100 32GB)
+
+Bartowski's GGUF for `XiaomiMiMo/MiMo-V2.5`. Three things make this launch
+non-trivial vs Mistral4: (a) `--hf-config-path` routes config through the
+full HF repo because transformers' GGUF parser doesn't have `mimo2` in
+its arch allowlist, (b) `--hf-overrides` strips the fp8 native-quant
+declaration plus the unused vision/audio/processor sub-configs, and
+(c) `--trust-remote-code` is needed for the GGUF loader's dummy
+meta-model build (transformers ships no native `MiMoV2` class).
+Cudagraph capture engages -- do **not** add `--enforce-eager`. Tool
+calling works via the `qwen3_coder` parser (MiMo's
+`<tool_call><function=...><parameter=...></parameter></function></tool_call>`
+envelope is token-identical to qwen3-coder's). Local bench (TP=8,
+max_model_len=4096, cudagraph + chunked-prefill + prefix-cache,
+max_num_seqs=8): ~42 tok/s single-stream short-decode, ~64 tok/s
+aggregate at batch=8.
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/bartowski/MiMo-V2.5-GGUF/MiMo-V2.5-Q3_K_M/MiMo-V2.5-Q3_K_M-00001-of-00004.gguf \
+  -e VLLM_SERVED_MODEL_NAME=MiMo-V2.5-Q3_K_M \
+  -e VLLM_QUANTIZATION=gguf \
+  -e VLLM_DTYPE=float16 \
+  -e VLLM_TENSOR_PARALLEL_SIZE=8 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.92 \
+  -e VLLM_MAX_MODEL_LEN=4096 \
+  -e VLLM_MAX_NUM_SEQS=8 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  -e VLLM_TOKENIZER=XiaomiMiMo/MiMo-V2.5 \
+  -e VLLM_HF_CONFIG_PATH=XiaomiMiMo/MiMo-V2.5 \
+  -e VLLM_HF_OVERRIDES='{"quantization_config":null,"vision_config":null,"audio_config":null,"processor_config":null}' \
+  -e VLLM_TRUST_REMOTE_CODE=1 \
+  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
+  -p 8000:8000 \
+  vllm-v100:latest \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
 ```
 
 ### Quick run (Qwen3.5-27B-AWQ on 2x V100)

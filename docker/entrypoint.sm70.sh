@@ -21,6 +21,7 @@ append_arg() {
 append_arg --host "${VLLM_HOST:-0.0.0.0}"
 append_arg --port "${VLLM_PORT:-8000}"
 append_arg --model "${VLLM_MODEL:-}"
+append_arg --tokenizer "${VLLM_TOKENIZER:-}"
 append_arg --served-model-name "${VLLM_SERVED_MODEL_NAME:-}"
 append_arg --quantization "${VLLM_QUANTIZATION:-awq}"
 append_arg --dtype "${VLLM_DTYPE:-float16}"
@@ -30,6 +31,8 @@ append_arg --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-}"
 append_arg --max-num-seqs "${VLLM_MAX_NUM_SEQS:-}"
 append_arg --max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
 append_arg --download-dir "${VLLM_DOWNLOAD_DIR:-}"
+append_arg --hf-config-path "${VLLM_HF_CONFIG_PATH:-}"
+append_arg --hf-overrides "${VLLM_HF_OVERRIDES:-}"
 
 args+=(
     --attention-backend "${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
@@ -39,6 +42,10 @@ args+=(
 
 if [[ "${VLLM_SKIP_MM_PROFILING:-1}" != "0" ]]; then
     args+=(--skip-mm-profiling)
+fi
+
+if [[ "${VLLM_TRUST_REMOTE_CODE:-0}" != "0" ]]; then
+    args+=(--trust-remote-code)
 fi
 
 args+=("$@")
