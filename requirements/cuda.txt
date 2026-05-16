@@ -9,5 +9,11 @@ torch==2.9.1
 torchaudio==2.9.1
 # These must be updated alongside torch
 torchvision==0.24.1 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
+# torch 2.9.1+cu128 pins triton==3.5.1 in its own wheel metadata, but transitive
+# resolution lets a stray `pip install -U triton` over-install. Triton 3.6.0's
+# MLA decode codegen is ~3× slower on V100 sm_70 at long context (verified on
+# Mistral4-119B Q4_K_M T2 stress: 23.5 → 9.4 tok/s with 3.6.0, restored to 23.6
+# tok/s after pin). Match torch's pin explicitly.
+triton==3.5.1
 # FlashInfer should be updated together with the Dockerfile
 flashinfer-python==0.6.2
