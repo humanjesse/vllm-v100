@@ -490,6 +490,9 @@ at::Tensor flash_attention_decode_paged(
     case 128:
       LAUNCH_BY_PARTITION(128);
       break;
+    case 192:
+      LAUNCH_BY_PARTITION(192);
+      break;
     case 256:
       LAUNCH_BY_PARTITION(256);
       break;
