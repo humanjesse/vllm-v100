@@ -98,7 +98,12 @@ REGISTRY: dict[str, ModelConfig] = {
         # Cold-disk weight load measured 1645s on this 122 GiB AWQ; warm
         # load is ~126s per project memory. 1800s covers both.
         ready_timeout_s=1800,
-        suites=("smoke", "perf_t1", "pi_toolcall"),
+        # nul_scan is the load-bearing regression test for the fp16 last-layer
+        # AllReduce overflow fix in vllm/model_executor/models/minimax_m2.py.
+        # If anyone edits that file (or env-var defaults) and breaks the
+        # protection, this suite catches it via 4-turn polyfact decode + NUL
+        # scan. See humanjesse/vllm-v100#11.
+        suites=("smoke", "perf_t1", "pi_toolcall", "nul_scan"),
         baselines_tokps={
             # 2026-05-18: HTTP-measured perf_t1 = 73.35 tok/s median over
             # 5 warm runs (stdev ~1.0), TP=8, cudagraph + FLASH_ATTN_V100,

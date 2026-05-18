@@ -242,10 +242,137 @@ def pi_toolcall(model: ModelConfig, base_url: str = "http://127.0.0.1:8000") -> 
     }
 
 
+# ---------- nul-byte scan ----------
+
+# Multi-turn polyfact-style prompts used by `nul_scan`. Chosen because each
+# response decodes ~4-6K tokens of real code (the largest single tool the model
+# has for producing varied logits), and back-to-back turns build context depth
+# to mirror the regime where humanjesse/vllm-v100#11 originally fired. 4 turns
+# x ~4K tokens = ~16K tokens of decoded content per run -- short enough for a
+# fleet sweep, long enough to catch a regressed fp16 AR fix on V100 MoE models.
+_NUL_SCAN_TURNS: tuple[str, ...] = (
+    "Write a complete Python module implementing polynomial arithmetic over "
+    "Z[x]: a Polynomial class with __init__, __add__, __sub__, __mul__, "
+    "__divmod__, __mod__, __floordiv__, __eq__, __repr__, degree, "
+    "leading_coeff, is_zero. 100+ lines, docstrings included, raw code -- no "
+    "markdown wrapping, no bullet-point todo lists.",
+    "Now write a complete gcd.py: Euclidean GCD over Z[x] using "
+    "pseudo-remainder, extended Euclidean algorithm, content (GCD of "
+    "coefficients), primitive_part. 80+ lines.",
+    "Now write a complete finite_field.py: polynomial arithmetic mod p, "
+    "multiplicative inverses mod p, polynomial GCD mod p, division mod p. "
+    "100+ lines.",
+    "Now write a complete factor.py: top-level factor() combining content "
+    "extraction, square-free factorization, finite-field factorization, "
+    "brute-force factor recombination. 100+ lines.",
+)
+
+
+def nul_scan(model: ModelConfig, base_url: str = "http://127.0.0.1:8000") -> dict:
+    """Multi-turn polyfact-style decode + NUL-byte scan of all assistant
+    output. Targets the fp16 last-layer AllReduce overflow class
+    (humanjesse/vllm-v100#11) where NaN logits get sampled to token id 0 and
+    surface as 0x00 bytes via byte-fallback tokenizers.
+
+    Pass criteria:
+      * All N turns return a response with at least 1 token.
+      * Zero NUL bytes (0x00) across the entire concatenated assistant
+        transcript.
+
+    Fail modes worth investigating if this regresses:
+      * NULs > 0 -> the per-model fp32-AR fix in the relevant model file is
+        no longer doing its job (env var flipped? rebase dropped it?
+        upstream merge clobbered it?).
+      * Empty response -> tool-call/template/health issue, not this bug.
+    """
+    t0 = time.perf_counter()
+    err: str | None = None
+    details: dict = {}
+    passed = False
+    transcript_bytes = b""
+    n_turns = 0
+    n_total_tokens = 0
+    try:
+        messages: list[dict] = []
+        for prompt in _NUL_SCAN_TURNS:
+            messages.append({"role": "user", "content": prompt})
+            body = _post_json(
+                f"{base_url}/v1/chat/completions",
+                {
+                    "model": model.served_id,
+                    "messages": messages,
+                    "max_tokens": 4096,
+                    "temperature": 0.0,
+                    # Disable thinking blocks on models that support the
+                    # chat_template_kwarg -- they bloat tokens without
+                    # adding decode surface for this bug class.
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout_s=600,
+            )
+            msg = body["choices"][0]["message"]
+            # Collect every generated-token surface vLLM exposes. Models with
+            # a reasoning parser configured (e.g. MiniMax-M2.7 with
+            # --reasoning-parser minimax_m2) route tokens into `reasoning` /
+            # `reasoning_content`; tool-call args land in `tool_calls`. All of
+            # these went through the same TP AllReduce path, so all of them
+            # need to be NUL-scanned -- the bug we're catching surfaces in
+            # whichever output field happened to be active when a NaN logit
+            # picked token id 0.
+            parts: list[str] = []
+            for k in ("content", "reasoning", "reasoning_content"):
+                v = msg.get(k)
+                if v:
+                    parts.append(v)
+            for tc in msg.get("tool_calls") or []:
+                args = ((tc or {}).get("function") or {}).get("arguments")
+                if args:
+                    parts.append(args)
+            assistant_text = "".join(parts)
+            # Re-thread the assistant turn for the next prompt. For most
+            # models `content` carries the visible answer; for reasoning-
+            # parser models we splice the reasoning back in so the next turn
+            # has the same context the model thinks it has.
+            messages.append({"role": "assistant", "content": assistant_text})
+            transcript_bytes += assistant_text.encode("utf-8", errors="surrogateescape")
+            n_turns += 1
+            n_total_tokens += body.get("usage", {}).get("completion_tokens", 0)
+
+        nul_count = transcript_bytes.count(b"\x00")
+        # Other control chars (everything <0x20 except \t \n \r). Symptom of
+        # the same class -- byte-fallback tokenizers can also emit other
+        # low-bytes when logits go NaN at certain positions.
+        ctrl_count = sum(
+            1 for b in transcript_bytes
+            if b < 0x20 and b not in (0x09, 0x0A, 0x0D)
+        )
+        details = {
+            "n_turns": n_turns,
+            "bytes": len(transcript_bytes),
+            "tokens": n_total_tokens,
+            "nul_bytes": nul_count,
+            "other_ctrl_bytes": ctrl_count,
+        }
+        passed = n_turns == len(_NUL_SCAN_TURNS) and nul_count == 0
+    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as e:
+        err = f"{type(e).__name__}: {e}"
+        details = {
+            "n_turns": n_turns,
+            "bytes": len(transcript_bytes),
+            "nul_bytes": transcript_bytes.count(b"\x00"),
+        }
+    return {
+        "name": "nul_scan", "passed": passed,
+        "elapsed_s": time.perf_counter() - t0,
+        "details": details, "error": err,
+    }
+
+
 SUITE_FUNCS = {
     "smoke": smoke,
     "perf_t1": perf_t1,
     "perf_t2": perf_t2,
     "perf_t3": perf_t3,
     "pi_toolcall": pi_toolcall,
+    "nul_scan": nul_scan,
 }
