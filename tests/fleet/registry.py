@@ -39,7 +39,12 @@ REGISTRY: dict[str, ModelConfig] = {
         name="granite",
         launch_script="~/launch_granite.sh",
         served_id="granite-4.1-8b-AWQ-INT4",
-        ready_timeout_s=120,
+        # Bumped from 120s — the 120s budget covered weight load + Dynamo cache
+        # hit but didn't leave room for cudagraph capture under sequential
+        # disk pressure (full-fleet sweep 2026-05-18 hit it at 67s into boot
+        # with cudagraph capture still running). 300s is the realistic worst-
+        # case for a cold-page-cache boot following a 119B-GGUF launch.
+        ready_timeout_s=300,
         suites=("smoke", "perf_t1", "pi_toolcall"),
         baselines_tokps={
             # 2026-05-17: HTTP-measured perf_t1 = 164.0 tok/s, TP=2, cudagraph.
@@ -70,7 +75,11 @@ REGISTRY: dict[str, ModelConfig] = {
         name="mistral4",
         launch_script="~/launch_mistral4.sh",
         served_id="Mistral-Small-4-119B-Q4_K_M",
-        ready_timeout_s=1200,
+        # Bumped from 1200s — full-fleet sweep 2026-05-18 timed out at 1200s
+        # mid-tensor-materialization (cold disk after granite + qwen36 page-
+        # cache eviction). 1800s covers worst-case cold-disk on this 119B
+        # GGUF without changing warm-disk fast-path behavior.
+        ready_timeout_s=1800,
         suites=("smoke", "perf_t1", "perf_t2", "perf_t3", "pi_toolcall"),
         baselines_tokps={
             "perf_t1": 83.5,  # short-prompt 256-tok decode (T1)
@@ -95,9 +104,13 @@ REGISTRY: dict[str, ModelConfig] = {
         name="minimax_m27",
         launch_script="~/launch_minimax_m2.sh",
         served_id="MiniMax-M2.7-AWQ-4bit",
-        # Cold-disk weight load measured 1645s on this 122 GiB AWQ; warm
-        # load is ~126s per project memory. 1800s covers both.
-        ready_timeout_s=1800,
+        # Cold-disk weight load measured 1645s standalone, but full-fleet
+        # sweep 2026-05-18 ran past 1800s mid-load (26/27 shards at the
+        # timeout, ~69s/shard sustained — sequential disk pressure from the
+        # 4 prior launches in the same session). 2400s covers worst-case
+        # cold-disk-after-fleet-pressure for this 122 GiB AWQ (27 shards
+        # × ~70s + init).
+        ready_timeout_s=2400,
         # nul_scan is the load-bearing regression test for the fp16 last-layer
         # AllReduce overflow fix in vllm/model_executor/models/minimax_m2.py.
         # If anyone edits that file (or env-var defaults) and breaks the
