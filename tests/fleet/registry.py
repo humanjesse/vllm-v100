@@ -91,6 +91,30 @@ REGISTRY: dict[str, ModelConfig] = {
             "perf_t1": 47.5,
         },
     ),
+    "minimax_m27": ModelConfig(
+        name="minimax_m27",
+        launch_script="~/launch_minimax_m2.sh",
+        served_id="MiniMax-M2.7-AWQ-4bit",
+        # Cold-disk weight load measured 1645s on this 122 GiB AWQ; warm
+        # load is ~126s per project memory. 1800s covers both.
+        ready_timeout_s=1800,
+        suites=("smoke", "perf_t1", "pi_toolcall"),
+        baselines_tokps={
+            # 2026-05-18: HTTP-measured perf_t1 = 73.35 tok/s median over
+            # 5 warm runs (stdev ~1.0), TP=8, cudagraph + FLASH_ATTN_V100,
+            # max_num_seqs=4. Higher than the project memory note of
+            # "~54 tok/s decode at batch=1" — that earlier figure was a
+            # single eager-mode measurement; this is the cudagraph regime
+            # called out in bayley's reproducer config.
+            #
+            # NOTE: this baseline assumes the fp16 last-layer AllReduce
+            # overflow fix landed in vllm/model_executor/models/minimax_m2.py
+            # is active (default VLLM_ALLREDUCE_OVERFLOW_STRATEGY=fast).
+            # Without it, the model produces NUL bytes in long-context
+            # output (humanjesse/vllm-v100#11).
+            "perf_t1": 73.35,
+        },
+    ),
 }
 
 
