@@ -175,17 +175,21 @@ class MiniMaxM2MoE(nn.Module):
             elif _ALLREDUCE_STRATEGY == "all" or (
                 _ALLREDUCE_STRATEGY in ("last", "fast") and self.is_last_layer
             ):
-                # FP32 AR + nan_to_num on cast-back.
+                # FP32 AR + clamp-then-nan_to_num on cast-back.
+                # nan_to_num posinf/neginf only catches values that are
+                # *already* ±inf in fp32. Large-but-finite fp32 sums
+                # (e.g. summing 8 ranks) sail through unchanged and
+                # overflow to ±inf when cast back to fp16. Clamp first
+                # so the cast cannot overflow.
                 ar_dtype = final_hidden_states.dtype
                 fp32 = final_hidden_states.to(torch.float32)
                 fp32 = tensor_model_parallel_all_reduce(fp32)
                 finfo = torch.finfo(ar_dtype)
-                final_hidden_states = torch.nan_to_num(
-                    fp32,
-                    nan=0.0,
-                    posinf=finfo.max,
-                    neginf=finfo.min,
-                ).to(ar_dtype)
+                fp32 = torch.clamp(fp32, min=finfo.min, max=finfo.max)
+                fp32 = torch.nan_to_num(
+                    fp32, nan=0.0, posinf=finfo.max, neginf=finfo.min
+                )
+                final_hidden_states = fp32.to(ar_dtype)
             elif _ALLREDUCE_STRATEGY == "last":
                 # FP16 AR + clamp to FP16 finite range.
                 final_hidden_states = tensor_model_parallel_all_reduce(
