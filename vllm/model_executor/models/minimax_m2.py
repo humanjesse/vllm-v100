@@ -70,15 +70,45 @@ from .utils import (
 )
 
 
+# vllm-v100 (SM_70 Volta) FP16 AllReduce overflow mitigation for MiniMaxM2.
+#
+# Same class of bug we already patch for Mistral4 / Trinity / DeepseekV2: the
+# fp16 TP AllReduce that follows each MoE block can saturate to +/-Inf under
+# real-workload activations, producing NaN logits downstream. The MiniMax
+# tokenizer's byte fallback (token id 0 -> byte 0x00) then surfaces those NaNs
+# as NUL characters embedded in tool-call arguments, which OpenCode / Pi reject
+# as "NUL characters not allowed in source." Cross-reference:
+# https://github.com/humanjesse/vllm-v100/issues/11.
+#
+# VLLM_ALLREDUCE_OVERFLOW_STRATEGY selects between four policies:
+#
+#   "none" : vanilla FP16 AR for every layer (bayley's original buggy
+#            behaviour, kept for A/B reproduction).
+#   "all"  : every layer's AR promoted to FP32 + nan_to_num on cast-back.
+#            Safest, ~2x AR bandwidth across all layers.
+#   "last" : last decoder layer's AR runs in FP32; other layers do FP16 AR
+#            + clamp to FP16 finite range. Defense-in-depth without the
+#            full bandwidth hit.
+#   "fast" : last decoder layer's AR runs in FP32; other layers do plain
+#            FP16 AR (no clamp). Empirically the cheapest config that fixes
+#            the NUL output on MiniMax-M2.7 AWQ on V100. DEFAULT.
+import os as _os
+_ALLREDUCE_STRATEGY: str = _os.environ.get(
+    "VLLM_ALLREDUCE_OVERFLOW_STRATEGY", "fast"
+)
+
+
 class MiniMaxM2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_last_layer: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.is_last_layer = is_last_layer
 
         if self.tp_size > config.num_local_experts:
             raise ValueError(
@@ -133,9 +163,47 @@ class MiniMaxM2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        final_hidden_states = final_hidden_states
+        # SM_70 FP16 AllReduce overflow mitigation. The branch on
+        # ``_ALLREDUCE_STRATEGY`` is a Python ``str`` compared against
+        # constants, so torch.compile specialises one of the four arms as
+        # the active code path at capture time.
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if _ALLREDUCE_STRATEGY == "none":
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            elif _ALLREDUCE_STRATEGY == "all" or (
+                _ALLREDUCE_STRATEGY in ("last", "fast") and self.is_last_layer
+            ):
+                # FP32 AR + clamp-then-nan_to_num on cast-back.
+                # nan_to_num posinf/neginf only catches values that are
+                # *already* ±inf in fp32. Large-but-finite fp32 sums
+                # (e.g. summing 8 ranks) sail through unchanged and
+                # overflow to ±inf when cast back to fp16. Clamp first
+                # so the cast cannot overflow.
+                ar_dtype = final_hidden_states.dtype
+                fp32 = final_hidden_states.to(torch.float32)
+                fp32 = tensor_model_parallel_all_reduce(fp32)
+                finfo = torch.finfo(ar_dtype)
+                fp32 = torch.clamp(fp32, min=finfo.min, max=finfo.max)
+                fp32 = torch.nan_to_num(
+                    fp32, nan=0.0, posinf=finfo.max, neginf=finfo.min
+                )
+                final_hidden_states = fp32.to(ar_dtype)
+            elif _ALLREDUCE_STRATEGY == "last":
+                # FP16 AR + clamp to FP16 finite range.
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+                finfo = torch.finfo(final_hidden_states.dtype)
+                final_hidden_states = torch.clamp(
+                    final_hidden_states, min=finfo.min, max=finfo.max
+                )
+            else:
+                # ``fast`` non-last layer: plain FP16 AR, no clamp.
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -281,6 +349,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config=config,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            is_last_layer=(layer_idx == config.num_hidden_layers - 1),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
