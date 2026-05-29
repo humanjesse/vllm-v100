@@ -24,10 +24,12 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | [Intel/DeepSeek-V4-Flash-W4A16-AutoRound](https://huggingface.co/Intel/DeepSeek-V4-Flash-W4A16-AutoRound) | 290B (37B active) | auto-round W4A16 | MoE (256 experts) + MLA + sparse-attn + Hyper-Connections | 8 | Working (single-request, ~5.66 tok/s decode-only) |
 | [bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF) (Q4_K_M) | 119B | GGUF Q4_K_M | MoE + MLA (`Mistral4ForCausalLM`) | 8 | Working (cudagraph; ~82 tok/s short prompt, ~24 tok/s @ 6k-tok prompt, ~26 tok/s prefix-cache replay) |
 | [bartowski/MiMo-V2.5-GGUF](https://huggingface.co/bartowski/MiMo-V2.5-GGUF) (Q3_K_M) | 310B (15B active) | GGUF Q3_K_M | MoE + hybrid SWA + asymmetric head_dim (`MiMoV2FlashForCausalLM`) | 8 | Working (cudagraph; ~42 tok/s single-stream, ~64 tok/s aggregate batch=8) |
+| [unsloth/Kimi-K2.6-GGUF](https://huggingface.co/unsloth/Kimi-K2.6-GGUF) (UD-Q8_K_XL) | 1T (32B active) | GGUF UD-Q8_K_XL | MoE (384 experts top-8 + 1 shared) + MLA (`DeepseekV3ForCausalLM`, rebadged from `kimi_k2`) | 8 | Working (PP=3 3-node fleet, enforce-eager; ~4.0 tok/s single-stream, ~15.7 tok/s aggregate batch=4; needs `VLLM_FP32_SHARED_EXPERT_LAYERS=41-47` for fp16 shared-expert overflow) |
 
 ## Hardware tested
 
 - 8x Tesla V100 SXM2 32GB (TP=8, no expert parallel)
+- 3x [8x Tesla V100 SXM2 32GB] fleet over ~1 GbE (TP=8 PP=3, 24 GPUs) -- for Kimi-K2.6 (554 GiB GGUF spans 3 nodes; Ray + RayExecutorV2 backend)
 
 ## Known issues
 
