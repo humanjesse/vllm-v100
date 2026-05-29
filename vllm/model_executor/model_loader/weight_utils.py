@@ -931,7 +931,9 @@ def get_gguf_weight_type_map(
 
 
 def gguf_quant_weights_iterator(
-    gguf_file: str, gguf_to_hf_name_map: dict[str, str]
+    gguf_file: str,
+    gguf_to_hf_name_map: dict[str, str],
+    name_filter=None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the quant weights in the model gguf files and convert
@@ -940,6 +942,12 @@ def gguf_quant_weights_iterator(
     we have to yield all weight types first before yielding any weights.
     Otherwise it would cause issue when loading weights with for packed
     layer with different quant types.
+
+    If ``name_filter`` is provided, it is called with the HF parameter name
+    and only tensors for which it returns True are yielded. The check happens
+    BEFORE ``tensor.data`` access so filtered-out tensors do not trigger
+    page faults — important for PP setups where each rank only owns a
+    subset of layers and we want to skip disk reads for the rest.
     """
 
     reader = gguf.GGUFReader(gguf_file)
@@ -948,6 +956,8 @@ def gguf_quant_weights_iterator(
         if tensor.name in gguf_to_hf_name_map:
             weight_type = tensor.tensor_type
             name = gguf_to_hf_name_map[tensor.name]
+            if name_filter is not None and not name_filter(name):
+                continue
 
             if weight_type.name not in ("F32", "BF16", "F16"):
                 weight_type_name = name.replace("weight", "qweight_type")
@@ -956,9 +966,11 @@ def gguf_quant_weights_iterator(
 
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
+            name = gguf_to_hf_name_map[tensor.name]
+            if name_filter is not None and not name_filter(name):
+                continue
             weight = tensor.data
             weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
             if weight_type.name not in ("F32", "BF16", "F16"):
                 name = name.replace("weight", "qweight")
             if weight_type.name == "BF16" and tensor.data.dtype == np.uint8:

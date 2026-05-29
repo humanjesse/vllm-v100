@@ -214,6 +214,15 @@ class WorkerWrapperBase:
         """
         if self.rpc_rank in rank_mapping:
             self.rpc_rank = rank_mapping[self.rpc_rank]
+            # vllm-project/vllm PR #41298 (also #31580): without this line,
+            # every worker keeps a stale global_rank after rerank, so
+            # `kv_cache_configs[self.global_rank]` indexes the WRONG slot
+            # under PP>1 + Ray, causing each PP rank to receive another
+            # rank's kv_cache_groups. Manifests at first forward as
+            # `KeyError: 'model.layers.<other-rank-first-layer>.self_attn.attn'`
+            # in get_attention_context. Issue #41287 (Qwen3-32B TP=8 PP=3)
+            # is the same root cause as this fork's Kimi-K2.6 TP=8 PP=3.
+            self.global_rank = self.rpc_rank
 
     def update_environment_variables(
         self,
