@@ -24,61 +24,9 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
-
-# V100 fp16 AllReduce overflow mitigation for MoE models. Same shape as
-# `minimax_m2.py`. Applies to Kimi-K2.6 (deepseek_v3 arch) under PP=3 TP=8
-# load: batch=4 concurrent requests produced "!!!!!!" garbage tokens
-# (fp16 logits overflow → degenerate softmax → low-id token argmax).
-# Single-request worked because batch=1 has less accumulation pressure.
-#
-# Strategies (selected via VLLM_ALLREDUCE_OVERFLOW_STRATEGY):
-#   "none" : vanilla FP16 AR (buggy on V100 MoE under load)
-#   "all"  : every MoE layer FP32-AR + clamp + nan_to_num
-#   "last" : last decoder MoE FP32-AR; others FP16-AR + clamp
-#   "fast" : last decoder MoE FP32-AR; others vanilla FP16 (DEFAULT)
-_KIMI_ALLREDUCE_STRATEGY: str = os.environ.get(
-    "VLLM_ALLREDUCE_OVERFLOW_STRATEGY", "fast"
-)
-
-# V100 fp16 shared-expert overflow mitigation (Kimi-K2.6 specific). The shared
-# expert is REPLICATED across TP ranks (not sharded), so when its down_proj
-# overflows fp16 in the matmul accumulator, every rank produces the same
-# NaN/Inf locally — masking strategies at the AR site fight a symptom, not the
-# cause. This env var (comma-separated layer indices) opts those layers'
-# `DeepseekV2MoE.shared_experts` into a fp32 forward path: gate_up runs at
-# fp16, then silu/multiply + down_proj run at fp32 using a one-time
-# dequantized fp32 copy of the down_proj GGUF weight (~7 MB per TP rank for
-# hidden=7168 / moe_intermediate=2048 / TP=8).
-#
-# 2026-05-28 batch=4 r0 repro localized initial overflow to layer 41
-# (HANDOFF_kimi_k26_fp16_localized_partial.md). 2026-05-29 polyfact /
-# code-generation stress tests showed the cascade extends through layers
-# 42-47 for different prompts. Default covers the full observed cascade
-# range. Empty string disables. ~7 MB per layer per TP rank → ~50 MB
-# total per rank for 7 layers (negligible on 32 GiB cards).
-_VLLM_FP32_SHARED_EXPERT_LAYERS: frozenset[int] = frozenset(
-    int(s) for s in os.environ.get(
-        "VLLM_FP32_SHARED_EXPERT_LAYERS", "41,42,43,44,45,46,47"
-    ).split(",") if s.strip()
-)
-
-# Additional layers (beyond `is_last_layer` set by strategy=fast/last) that
-# should use FP32 all-reduce. WARNING (2026-05-29): enabling fp32-AR at
-# layer 41 in conjunction with fp32 shared-expert fixes batch=4 r0
-# (gardening) but REGRESSES single-request r1-style prompts like "Explain
-# in 3 short paragraphs how RAFT consensus elects a leader." that
-# previously worked at baseline (bangs cascade reappears). The numerical
-# shift caused by fp32-AR at layer 41 changes routing/saturation patterns
-# elsewhere in a prompt-specific way. Default empty until investigated.
-_VLLM_KIMI_FP32_AR_LAYERS: frozenset[int] = frozenset(
-    int(s) for s in os.environ.get(
-        "VLLM_KIMI_FP32_AR_LAYERS", ""
-    ).split(",") if s.strip()
-)
 
 import torch
 from torch import nn
@@ -93,7 +41,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -236,7 +183,6 @@ class DeepseekV2MLP(nn.Module):
         reduce_results: bool = True,
         is_sequence_parallel=False,
         prefix: str = "",
-        compute_in_fp32: bool = False,
     ) -> None:
         super().__init__()
 
@@ -266,87 +212,12 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        # V100 fp16 shared-expert overflow opt-in. Set by DeepseekV2MoE for
-        # layers in _VLLM_FP32_SHARED_EXPERT_LAYERS. Forward runs gate_up at
-        # fp16 (typically safe, K=hidden=7168 with O(1) activations), then
-        # silu/multiply + down_proj at fp32 using a one-time dequantized fp32
-        # copy of the down_proj GGUF weight. Bypasses fused_mul_mat_gguf for
-        # down_proj only — the rest of the MoE wiring is untouched.
-        self._compute_in_fp32 = compute_in_fp32
-        self._fp32_down_w: torch.Tensor | None = None
-
-    def _materialize_fp32_down_weight(self) -> torch.Tensor:
-        """One-time materialize down_proj's weight as a dense fp32 buffer.
-
-        Handles two paths because the UD-Q8_K_XL GGUF keeps some F16 tensors
-        unquantized (UnquantizedLinearMethod uses `.weight`) and quantizes
-        others (GGUFLinearMethod uses `.qweight`/`.qweight_type`):
-
-        1. GGUF quantized: dequant via `ggml_dequantize`. Shape derivation
-           mirrors `_fused_mul_mat_gguf` so we stay correct regardless of
-           whether `qweight.tensor_shape` survived `materialize()`.
-        2. Unquantized (UD-Q8_K_XL ships shared experts in F16 in some
-           layers): just `.weight.float()`.
-
-        Returns a dense fp32 tensor of shape [hidden_size, intermediate/TP]
-        — exactly what `F.linear` expects.
-        """
-        dp = self.down_proj
-        if hasattr(dp, "qweight") and hasattr(dp, "qweight_type"):
-            import gguf as _gguf
-
-            from vllm import _custom_ops as ops
-
-            qweight = dp.qweight
-            qweight_type = int(dp.qweight_type.weight_type)
-            block_size, type_size = _gguf.GGML_QUANT_SIZES[qweight_type]
-            m = qweight.shape[0]
-            n = qweight.shape[1] // type_size * block_size
-            w_fp32 = ops.ggml_dequantize(qweight, qweight_type, m, n, torch.float32)
-            return w_fp32.detach()
-        if hasattr(dp, "weight"):
-            return dp.weight.detach().to(torch.float32)
-        raise RuntimeError(
-            "compute_in_fp32 requested but down_proj has neither qweight nor "
-            "weight attribute; cannot materialize fp32 buffer."
-        )
 
     def forward(self, x):
-        if self._compute_in_fp32:
-            return self._forward_fp32(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
-    def _forward_fp32(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        gate_up, _ = self.gate_up_proj(x)
-        # Clamp any fp16 Inf at gate_up boundary before fp32 cast, so the
-        # subsequent silu*up multiply has a chance of staying bounded.
-        if gate_up.dtype == torch.float16:
-            finfo16 = torch.finfo(torch.float16)
-            gate_up = torch.nan_to_num(
-                gate_up, nan=0.0, posinf=finfo16.max, neginf=finfo16.min
-            )
-        gate_up_fp32 = gate_up.to(torch.float32)
-        gate, up = gate_up_fp32.chunk(2, dim=-1)
-        intermediate_fp32 = torch.nn.functional.silu(gate) * up
-        if self._fp32_down_w is None:
-            self._fp32_down_w = self._materialize_fp32_down_weight()
-        out_fp32 = torch.nn.functional.linear(intermediate_fp32, self._fp32_down_w)
-        # Clamp to fp16 finite range BEFORE cast-back. Without this clamp,
-        # values > 65504 cast to fp16 produce ±Inf, which (a) defeats the
-        # purpose of the fp32 path, and (b) saturates downstream AR to Inf.
-        # Pair with VLLM_KIMI_FP32_AR_LAYERS routing this layer's AR through
-        # fp32 so the sum-of-8-ranks doesn't itself overflow.
-        if in_dtype == torch.float16:
-            finfo16 = torch.finfo(torch.float16)
-            out_fp32 = torch.clamp(out_fp32, min=finfo16.min, max=finfo16.max)
-        # down_proj has reduce_results=False for shared_experts (see
-        # DeepseekV2MoE), so no AR fires here — partial sum returns to MoE
-        # forward, which adds it to fused_moe output before the MoE-level AR.
-        return out_fp32.to(in_dtype)
 
 
 class DeepseekV2MoE(nn.Module):
@@ -356,19 +227,10 @@ class DeepseekV2MoE(nn.Module):
         parallel_config: ParallelConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        is_last_layer: bool = False,
-        layer_idx: int = -1,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        # V100 fp16 AR overflow mitigation — see module-level comment.
-        self.is_last_layer = is_last_layer
-        # Extra fp32-AR opt-in: layers listed in _VLLM_KIMI_FP32_AR_LAYERS
-        # join the existing last-layer fp32-AR path. Off by default
-        # (pairs with fp32 shared-expert if needed, but enabling on layer
-        # 41 regressed previously-passing prompts in 2026-05-29 testing).
-        self._use_fp32_ar_extra = layer_idx in _VLLM_KIMI_FP32_AR_LAYERS
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
@@ -431,7 +293,6 @@ class DeepseekV2MoE(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
-                compute_in_fp32=(layer_idx in _VLLM_FP32_SHARED_EXPERT_LAYERS),
             )
 
         n_group = getattr(config, "n_group", 1)
@@ -517,48 +378,9 @@ class DeepseekV2MoE(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1:
-            # Clean per-rank MoE+shared-expert output BEFORE all-reduce. Without
-            # this, a single rank's NaN/Inf propagates to all 8 ranks via the
-            # AR sum. With this, a bad rank contributes its fp16 saturation
-            # instead of NaN-poisoning the AR sum.
-            if final_hidden_states.dtype == torch.float16:
-                _finfo = torch.finfo(final_hidden_states.dtype)
-                final_hidden_states = torch.nan_to_num(
-                    final_hidden_states,
-                    nan=0.0, posinf=_finfo.max, neginf=_finfo.min,
-                )
-            if _KIMI_ALLREDUCE_STRATEGY == "all" or (
-                _KIMI_ALLREDUCE_STRATEGY in ("last", "fast")
-                and self.is_last_layer
-            ) or self._use_fp32_ar_extra:
-                # Last-layer fp32 AR + clamp-then-nan_to_num on cast-back
-                # (same pattern as minimax_m2.py). Large-but-finite fp32 sums
-                # overflow to ±inf when cast back to fp16, so clamp first.
-                ar_dtype = final_hidden_states.dtype
-                fp32 = final_hidden_states.to(torch.float32)
-                fp32 = tensor_model_parallel_all_reduce(fp32)
-                finfo = torch.finfo(ar_dtype)
-                fp32 = torch.clamp(fp32, min=finfo.min, max=finfo.max)
-                fp32 = torch.nan_to_num(
-                    fp32, nan=0.0, posinf=finfo.max, neginf=finfo.min
-                )
-                final_hidden_states = fp32.to(ar_dtype)
-            elif _KIMI_ALLREDUCE_STRATEGY == "last":
-                final_hidden_states = (
-                    self.experts.maybe_all_reduce_tensor_model_parallel(
-                        final_hidden_states
-                    )
-                )
-                finfo = torch.finfo(final_hidden_states.dtype)
-                final_hidden_states = torch.clamp(
-                    final_hidden_states, min=finfo.min, max=finfo.max
-                )
-            else:
-                final_hidden_states = (
-                    self.experts.maybe_all_reduce_tensor_model_parallel(
-                        final_hidden_states
-                    )
-                )
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -651,15 +473,11 @@ class DeepseekV2Attention(nn.Module):
             prefix=f"{prefix}.kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        # FORK: declare kv_b_proj with quant_config=None so the param is named
-        # `.weight` (not `.qweight`) — Bartowski/Unsloth GGUFs ship MLA K/V upcasts
-        # split as per-layer attn_k_b + attn_v_b, which our `_mistral4_kv_b_iterator`
-        # (in gguf_loader.py) fuses + dequantizes into a single fp16 `kv_b_proj.weight`.
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
         # O projection.
@@ -728,18 +546,6 @@ class DeepseekV2Attention(nn.Module):
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        if os.environ.get("VLLM_PP_POS_DEBUG"):
-            try:
-                import sys as _sys
-                from vllm.distributed import get_pp_group as _gpp, get_tensor_model_parallel_rank as _gtp
-                if positions.numel() > 1:  # prefill only
-                    _pp = _gpp().rank_in_group
-                    if _gtp() == 0:  # one line per PP stage, not per TP shard
-                        print("[PPDBG] pp=%d rope_pos n=%d min=%d max=%d" % (
-                            _pp, positions.numel(), int(positions.min()), int(positions.max())),
-                            file=_sys.stderr, flush=True)
-            except Exception as _e:
-                pass
 
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
@@ -993,13 +799,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 prefix=f"{prefix}.q_proj",
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        # FORK: see DeepseekV2Attention.kv_b_proj note above — quant_config=None
-        # so param is `.weight` (matches `_mistral4_kv_b_iterator` synthesis).
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -1169,8 +973,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                is_last_layer=(layer_idx == config.num_hidden_layers - 1),
-                layer_idx=layer_idx,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -1232,22 +1034,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
-
-        # V100 fp16 belt-and-suspenders cleanup at end of each decoder layer.
-        # The fp32 shared-expert at layer 41 (set via VLLM_FP32_SHARED_EXPERT_LAYERS)
-        # prevents the catastrophic NaN/Inf source, but a few non-catastrophic
-        # NaN/Inf entries still leak from upstream fp16 saturation for r0-style
-        # prompts. nan_to_num here keeps the residual stream finite without
-        # introducing the fluent-hallucination saturation trap seen at smaller
-        # caps (e.g. 8192 — see HANDOFF_kimi_k26_fp16_localized_partial.md).
-        if hidden_states.dtype == torch.float16:
-            finfo = torch.finfo(torch.float16)
-            hidden_states = torch.nan_to_num(
-                hidden_states, nan=0.0, posinf=finfo.max, neginf=finfo.min
-            )
-            residual = torch.nan_to_num(
-                residual, nan=0.0, posinf=finfo.max, neginf=finfo.min
-            )
 
         return hidden_states, residual
 

@@ -956,8 +956,17 @@ def init_worker_distributed_environment(
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
     init_method = distributed_init_method or "env://"
+    # FORK PATCH: raise the NCCL collective watchdog from torch's 10-min default
+    # to 30 min. Needed for our Kimi-K2.6 PP=3 debug: a deterministic hang
+    # appears on the 2nd decode step's 4th collective in PG GUID 7. The 10-min
+    # default fires the watchdog and cascades to a forced abort BEFORE
+    # FlightRecorder finishes writing the dump file, so we never get to see
+    # which rank failed to enqueue. 30 min gives the FR dump room to land.
+    # Revert once the underlying hang is diagnosed.
+    from datetime import timedelta
     init_distributed_environment(
-        parallel_config.world_size, rank, init_method, local_rank, backend
+        parallel_config.world_size, rank, init_method, local_rank, backend,
+        timeout=timedelta(minutes=30),
     )
 
     ensure_model_parallel_initialized(

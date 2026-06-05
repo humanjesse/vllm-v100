@@ -23,6 +23,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.ray_utils import (
+    WORKER_SPECIFIC_ENV_VARS,
     FutureWrapper,
     RayWorkerWrapper,
     initialize_ray_cluster,
@@ -62,18 +63,8 @@ class RayWorkerMetaData:
 class RayDistributedExecutor(Executor):
     """Ray-based distributed executor"""
 
-    # These env vars are worker-specific, therefore are NOT copied
-    # from the driver to the workers
-    WORKER_SPECIFIC_ENV_VARS = {
-        "VLLM_HOST_IP",
-        "VLLM_HOST_PORT",
-        "LOCAL_RANK",
-        "CUDA_VISIBLE_DEVICES",
-        "HIP_VISIBLE_DEVICES",
-        "ROCR_VISIBLE_DEVICES",
-    }
-
-    # These non-vLLM env vars are copied from the driver to workers
+    # These non-vLLM env vars are copied from the driver to workers.
+    # (WORKER_SPECIFIC_ENV_VARS moved to module-level in ray_utils.py per PR #36836.)
     ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
     uses_ray: bool = True
@@ -338,7 +329,7 @@ class RayDistributedExecutor(Executor):
 
         # Environment variables to copy from driver to workers
         env_vars_to_copy = get_env_vars_to_copy(
-            exclude_vars=self.WORKER_SPECIFIC_ENV_VARS,
+            exclude_vars=WORKER_SPECIFIC_ENV_VARS,
             additional_vars=set(current_platform.additional_env_vars).union(
                 self.ADDITIONAL_ENV_VARS
             ),

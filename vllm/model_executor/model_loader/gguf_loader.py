@@ -128,12 +128,71 @@ def _mistral4_moe_iterator(
             yield name, torch.from_numpy(np.ascontiguousarray(slice_))
 
 
+def _build_pp_name_filter(num_hidden_layers: int):
+    """Build a callable filtering HF parameter names to this worker's PP shard.
+
+    Returns None when PP is not initialized or world_size == 1 (no filtering
+    needed). Otherwise returns ``f(name) -> bool`` that returns True iff
+    ``name`` belongs to this worker's PP rank:
+
+      * ``model.layers.X.*`` → True iff X in this rank's layer range
+      * ``model.embed_tokens.*`` / ``embed_tokens.weight`` → True iff PP rank 0
+      * ``model.norm.weight`` / ``lm_head.*`` → True iff PP rank N-1
+      * everything else → True (defensive; model code's
+        ``is_pp_missing_parameter`` covers the rest)
+
+    Avoiding ``tensor.data`` access for layers we don't own is the whole
+    point: at cold-disk read rates each unowned layer's tensors are
+    expensive even when the GGUF iteration is otherwise cheap, and with
+    PP=3 layer-sequential shard layouts the late ranks scan past the
+    early ranks' shards waiting for their own layers to appear.
+    """
+    try:
+        from vllm.distributed import get_pp_group
+        from vllm.distributed.utils import get_pp_indices
+    except ImportError:
+        return None
+    try:
+        pp_group = get_pp_group()
+    except Exception:
+        return None
+    pp_size = pp_group.world_size
+    if pp_size <= 1:
+        return None
+    pp_rank = pp_group.rank_in_group
+    start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+    is_first = pp_rank == 0
+    is_last = pp_rank == pp_size - 1
+    logger.info(
+        "GGUF PP loader filter: rank %d/%d owns layers [%d, %d) "
+        "(first=%s, last=%s); skipping tensor reads for other ranks' layers.",
+        pp_rank, pp_size, start, end, is_first, is_last,
+    )
+
+    def _filter(name: str) -> bool:
+        if name.startswith("model.layers."):
+            parts = name.split(".")
+            try:
+                idx = int(parts[2])
+            except (IndexError, ValueError):
+                return True
+            return start <= idx < end
+        if name.startswith("model.embed_tokens") or name == "embed_tokens.weight":
+            return is_first
+        if name == "model.norm.weight" or name.startswith("lm_head"):
+            return is_last
+        return True
+
+    return _filter
+
+
 def _mistral4_kv_b_iterator(
     gguf_files: list[str],
     num_heads: int,
     kv_lora: int,
     qk_nope: int,
     v_head: int,
+    layer_range: tuple[int, int] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Synthesize fused ``kv_b_proj.weight`` from split ``attn_k_b`` + ``attn_v_b``.
 
@@ -159,6 +218,7 @@ def _mistral4_kv_b_iterator(
     # the cross-shard accumulation pattern in _mistral4_moe_iterator above.
     k_b_tensors: dict[int, gguf.ReaderTensor] = {}
     v_b_tensors: dict[int, gguf.ReaderTensor] = {}
+    lo, hi = layer_range if layer_range is not None else (None, None)
     for path in gguf_files:
         reader = gguf.GGUFReader(path)
         for t in reader.tensors:
@@ -168,6 +228,8 @@ def _mistral4_kv_b_iterator(
             try:
                 layer_idx = int(parts[1])
             except (IndexError, ValueError):
+                continue
+            if layer_range is not None and not (lo <= layer_idx < hi):
                 continue
             if t.name.endswith(".attn_k_b.weight"):
                 k_b_tensors[layer_idx] = t
@@ -186,21 +248,37 @@ def _mistral4_kv_b_iterator(
         t_v = v_b_tensors[layer_idx]
         from vllm import _custom_ops as _ops
 
-        k_data = torch.from_numpy(np.ascontiguousarray(t_k.data)).cuda()
-        v_data = torch.from_numpy(np.ascontiguousarray(t_v.data)).cuda()
-        k_dq = _ops.ggml_dequantize(
-            k_data, int(t_k.tensor_type), num_heads * kv_lora, qk_nope,
-            torch.float16,
-        )
-        v_dq = _ops.ggml_dequantize(
-            v_data, int(t_v.tensor_type), num_heads * v_head, kv_lora,
-            torch.float16,
-        )
+        # ggml_dequantize only handles GGML quantized types (Q*/IQ*). For
+        # unquantized GGUF tensors (F32=0, F16=1, BF16=30) the raw bytes
+        # are already real values — reinterpret and cast to fp16 directly.
+        # (Bartowski's Mistral4 GGUFs are quantized; Unsloth's Kimi-K2.6
+        # UD-Q8_K_XL ships attn_k_b/attn_v_b as BF16, which would segfault
+        # through the quantized path.)
+        def _to_fp16(t, expect_rows, expect_cols):
+            tt = int(t.tensor_type)
+            if tt in (0, 1, 30):  # F32, F16, BF16
+                arr = np.ascontiguousarray(t.data)
+                if tt == 30:  # BF16: numpy lacks native dtype, gguf-py
+                    # returns uint8 raw bytes; view as int16, then as bf16
+                    raw = torch.from_numpy(arr).view(torch.int16)
+                    dq = raw.view(torch.bfloat16).to(torch.float16)
+                elif tt == 1:  # F16
+                    dq = torch.from_numpy(arr).view(torch.float16)
+                else:  # F32
+                    dq = torch.from_numpy(arr).to(torch.float16)
+                return dq.reshape(expect_rows, expect_cols).cuda()
+            data = torch.from_numpy(np.ascontiguousarray(t.data)).cuda()
+            return _ops.ggml_dequantize(
+                data, tt, expect_rows, expect_cols, torch.float16,
+            )
+
+        k_dq = _to_fp16(t_k, num_heads * kv_lora, qk_nope)
+        v_dq = _to_fp16(t_v, num_heads * v_head, kv_lora)
         k_b = k_dq.view(num_heads, kv_lora, qk_nope).transpose(1, 2)
         v_b = v_dq.view(num_heads, v_head, kv_lora)
         fused = torch.cat([k_b, v_b], dim=1).contiguous()
         fused = fused.view(num_heads * out_per_head, kv_lora).cpu()
-        del k_data, v_data, k_dq, v_dq, k_b, v_b
+        del k_dq, v_dq, k_b, v_b
         yield (
             f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight",
             fused,
@@ -427,6 +505,19 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+                # transformers>=4.55 DeepseekV3 fuses MoE experts into 3D
+                # nn.Parameter (no .weight, no expert index) — the dummy_model
+                # used here surfaces names like `model.layers.X.mlp.experts.
+                # gate_up_proj` and `experts.down_proj`. These are loaded at
+                # runtime via vLLM's gate_proj→gate_up_proj rename (see
+                # vllm/model_executor/models/deepseek_v2.py:1352); just
+                # silence the pre-flight unmapped check.
+                sideload_params.append(
+                    re.compile(
+                        f"model\\.layers\\.{idx}"
+                        r"\.mlp\.experts\.(gate_up_proj|down_proj)"
+                    )
+                )
         if model_type in ("qwen2_moe", "qwen3_moe"):
             model_type = model_type.replace("_", "")
             # GGUF layer map assumes that we will have a merged expert weights
@@ -549,9 +640,31 @@ class GGUFModelLoader(BaseModelLoader):
         auto_cls = (
             AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
         )
+        # vLLM's DeepseekV2MLAAttention.__init__ mutates
+        # `config.rope_parameters["rope_type"]` from "yarn" to "deepseek_yarn"
+        # (deepseek_v2.py:491-496) during the REAL model build. `_get_gguf_weights_map`
+        # is called twice — once before initialize_model, once inside load_weights
+        # AFTER initialize_model. The second call would pass the mutated config to
+        # transformers's `DeepseekV3RotaryEmbedding`, which looks up "deepseek_yarn"
+        # in `ROPE_INIT_FUNCTIONS` and raises KeyError because the key only exists
+        # in vLLM's own rope dispatch, not transformers's. Normalize the rope_type
+        # on a config copy so the dummy is buildable both times. (This affects
+        # only the dummy's tensor *name* extraction; rope_type doesn't influence
+        # which parameter names exist.)
+        from copy import copy as _shallow_copy
+        config_for_dummy = config
+        rope_params = getattr(config, "rope_parameters", None)
+        if isinstance(rope_params, dict) and rope_params.get("rope_type") in (
+            "deepseek_yarn",
+            "deepseek_llama_scaling",
+        ):
+            config_for_dummy = _shallow_copy(config)
+            config_for_dummy.rope_parameters = dict(rope_params)
+            config_for_dummy.rope_parameters["rope_type"] = "yarn"
         with torch.device("meta"):
             dummy_model = auto_cls.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
+                config_for_dummy,
+                trust_remote_code=model_config.trust_remote_code,
             )
 
         state_dict = dummy_model.state_dict()
@@ -706,13 +819,30 @@ class GGUFModelLoader(BaseModelLoader):
             and hf_config.vision_config is not None
         )
 
+        # PP-aware filter: avoid disk reads for tensors this rank doesn't own.
+        # When pp_size==1 or PP isn't initialized this returns None and the
+        # iterators behave identically to before.
+        pp_filter = _build_pp_name_filter(hf_config.num_hidden_layers)
+        layer_range = None
+        if pp_filter is not None:
+            from vllm.distributed import get_pp_group
+            from vllm.distributed.utils import get_pp_indices
+            _g = get_pp_group()
+            layer_range = get_pp_indices(
+                hf_config.num_hidden_layers,
+                _g.rank_in_group,
+                _g.world_size,
+            )
+
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
-            yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
+            yield from gguf_quant_weights_iterator(
+                mmproj_file, gguf_to_hf_name_map, name_filter=pp_filter,
+            )
 
         shards = _resolve_gguf_shards(model_name_or_path)
         if len(shards) > 1:
@@ -726,14 +856,31 @@ class GGUFModelLoader(BaseModelLoader):
                 kv_lora=hf_config.kv_lora_rank,
                 qk_nope=hf_config.qk_nope_head_dim,
                 v_head=hf_config.v_head_dim,
+                layer_range=layer_range,
             )
             yield from _mistral4_moe_iterator(shards)
+
+        # Unsloth/Bartowski deepseek-v3 family GGUFs (e.g. Kimi-K2.6) ship MLA
+        # K/V upcasts split as per-layer attn_k_b + attn_v_b tensors, but
+        # vLLM's DeepseekV2MLAAttention expects a fused kv_b_proj.weight.
+        # Reuse the mistral4 fuser — the GGUF layout is identical.
+        if hf_config.model_type in ("deepseek_v3", "deepseek_v2"):
+            yield from _mistral4_kv_b_iterator(
+                shards,
+                num_heads=hf_config.num_attention_heads,
+                kv_lora=hf_config.kv_lora_rank,
+                qk_nope=hf_config.qk_nope_head_dim,
+                v_head=hf_config.v_head_dim,
+                layer_range=layer_range,
+            )
 
         if hf_config.model_type == "mimo_v2":
             yield from _mimo2_attn_qkv_iterator(shards, hf_config)
 
         for shard in shards:
-            yield from gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
+            yield from gguf_quant_weights_iterator(
+                shard, gguf_to_hf_name_map, name_filter=pp_filter,
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)

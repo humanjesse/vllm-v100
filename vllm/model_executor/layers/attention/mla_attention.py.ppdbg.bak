@@ -188,7 +188,6 @@ return curr_o @ W_O
 """
 
 import functools
-import os
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -522,20 +521,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe = k_pe[:num_actual_toks, ...]
 
         # write the latent and rope to kv cache
-        if os.environ.get("VLLM_PP_POS_DEBUG") and k_c_normed.shape[0] > 1:
-            try:
-                import sys as _sys, torch.distributed as _dist
-                _r = _dist.get_rank() if _dist.is_initialized() else -1
-                _kc = k_c_normed.float()
-                _nanrows = int(_kc.isnan().any(dim=-1).sum())
-                _kpe = k_pe.float()
-                if _nanrows > 0 or _kc.abs().max().item() > 200:
-                    print("[NANW] layer=%s rank=%d toks=%d kc_absmax=%.4e kc_nanrows=%d kpe_absmax=%.4e kpe_nan=%s" % (
-                        self.layer_name, _r, k_c_normed.shape[0], _kc.abs().max().item(),
-                        _nanrows, _kpe.abs().max().item(), bool(_kpe.isnan().any())),
-                        file=_sys.stderr, flush=True)
-            except Exception:
-                pass
         if kv_cache.numel() > 0:
             ops.concat_and_cache_mla(
                 k_c_normed,
@@ -2372,16 +2357,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
-            if os.environ.get("VLLM_PP_POS_DEBUG"):
-                try:
-                    import sys as _sys
-                    _kc = workspace[:toks][..., : self.kv_lora_rank].float()
-                    _kf = k.float()
-                    print("[PPDBG-CTX] chunk=%d toks=%d gathered_kvc_absmax=%.4e recon_k_absmax=%.4e k_nan=%s" % (
-                        i, int(toks), _kc.abs().max().item(), _kf.abs().max().item(), bool(_kf.isnan().any())),
-                        file=_sys.stderr, flush=True)
-                except Exception:
-                    pass
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
