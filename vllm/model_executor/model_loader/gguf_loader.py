@@ -476,11 +476,17 @@ class GGUFModelLoader(BaseModelLoader):
                             r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                         )
                     )
-                    # Gated-DeltaNet dt_bias is a bare nn.Parameter (no
-                    # .weight/.bias suffix), so find_hf_name_in_tensor_map
-                    # can't route it through gguf-py. Map explicitly.
+                    # Gated-DeltaNet dt_bias and A_log are bare nn.Parameters
+                    # (no .weight/.bias suffix), so find_hf_name_in_tensor_map
+                    # can't route them through gguf-py (trailing-dot bug) and
+                    # they silently keep their init values. A_log is the SSM
+                    # decay (g = -exp(A_log)*softplus(...)) — losing it breaks
+                    # the whole recurrence. Map both explicitly.
                     gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
                         f"model.layers.{idx}.linear_attn.dt_bias"
+                    )
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
+                        f"model.layers.{idx}.linear_attn.A_log"
                     )
                 model_type = "qwen35moe"
             else:

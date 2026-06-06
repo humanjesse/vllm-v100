@@ -493,6 +493,36 @@ class Qwen3_5Model(Qwen3NextModel):
             if name.startswith("mtp."):
                 continue
 
+            # Weight-dump probe (VLLM_QWEN36_DBG=1): fingerprint what vLLM is
+            # about to load into each layer-0 GDN param + a router gate, to diff
+            # against the raw GGUF tensors and catch transpose/order/wrong-tensor
+            # loading bugs.
+            if _Q36_DBG and (
+                "layers.0.linear_attn." in name
+                or name.endswith("layers.1.mlp.gate.weight")
+                or "layers.1.mlp.experts.0.gate_proj" in name
+                or "layers.1.mlp.experts.0.down_proj" in name
+                or "layers.1.mlp.shared_expert.gate_proj" in name
+            ):
+                import sys as _sys
+
+                _lw = loaded_weight.detach().float()
+                _fl = _lw.flatten()
+                _n = _fl.numel()
+                _fp = (
+                    f"shape={tuple(loaded_weight.shape)} dt={loaded_weight.dtype} "
+                    f"mean={_lw.mean().item():.5e} std={_lw.std().item():.5e} "
+                    f"f0={_fl[0].item():.5e}"
+                )
+                if _n >= 2:
+                    _fp += f" f1={_fl[1].item():.5e} flast={_fl[-1].item():.5e}"
+                if _lw.dim() >= 2:
+                    _fp += (
+                        f" row0sum={_lw[0].sum().item():.5e} "
+                        f"col0sum={_lw[..., 0].sum().item():.5e}"
+                    )
+                print(f"[WDUMP] {name} {_fp}", file=_sys.stderr, flush=True)
+
             # Qwen3.5/3.6 use Gemma-style RMSNorm: y = (1 + weight) * x. During
             # GGUF conversion llama.cpp bakes the +1 into the stored weights and
             # applies a plain weight*x norm, so the GGUF norm weights are ~1.0.
@@ -741,6 +771,33 @@ class Qwen3_5Model(Qwen3NextModel):
                         pass
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if _Q36_DBG:
+            import sys as _sys
+
+            for _pn, _p in self.named_parameters():
+                if not any(f".layers.{i}." in _pn for i in (0, 1, 3)):
+                    continue
+                if _p.dtype in (
+                    torch.int8,
+                    torch.uint8,
+                    torch.int16,
+                    torch.int32,
+                    torch.int64,
+                ):
+                    continue  # GGUF qweight / qweight_type storage, skip
+                _pf = _p.detach().float()
+                _amax = _pf.abs().max().item()
+                _std = _pf.std().item() if _p.numel() > 1 else 0.0
+                # garbage-init signatures: absurd magnitude, all-zero, all-equal
+                if _amax > 50 or _amax == 0.0 or (_p.numel() > 1 and _std == 0.0):
+                    print(
+                        f"[SUSPECT] {_pn} shape={tuple(_p.shape)} "
+                        f"absmax={_amax:.3e} std={_std:.3e} "
+                        f"mean={_pf.mean().item():.3e}",
+                        file=_sys.stderr,
+                        flush=True,
+                    )
         return loaded_params
 
     def forward(
