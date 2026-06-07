@@ -473,6 +473,68 @@ class GGUFModelLoader(BaseModelLoader):
         )
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
+        if model_type == "qwen3_5_mtp":
+            # Speculative-decoding MTP draft for Qwen3.5/3.6 GGUF. The bartowski
+            # text GGUF ships exactly one block past num_hidden_layers
+            # (qwen35moe.nextn_predict_layers=1): a full-attention + MoE decoder
+            # layer plus the nextn.* projections. transformers has no
+            # Qwen3_5MoeMTP AutoModel, so the dummy-model name map built below
+            # can't be derived — hand-map the (small, fixed) MTP tensor set and
+            # return. Names must start with "mtp." (Qwen3_5MTP.load_weights drops
+            # anything else); the model's stacked_params_mapping folds
+            # q/k/v_proj -> qkv_proj, gate/up_proj -> gate_up_proj, and merged 3D
+            # expert tensors are full-loaded by FusedMoE.weight_loader. The MTP
+            # block is full-attention (no ssm_*), so no GDN v-head permute.
+            mtp_start = text_config.num_hidden_layers
+            num_mtp = getattr(text_config, "mtp_num_hidden_layers", 1) or 1
+            for j in range(num_mtp):
+                b = mtp_start + j  # GGUF block index of MTP layer j
+                p = f"mtp.layers.{j}"
+                gguf_to_hf_name_map.update({
+                    f"blk.{b}.attn_norm.weight": f"{p}.input_layernorm.weight",
+                    f"blk.{b}.attn_q.weight": f"{p}.self_attn.q_proj.weight",
+                    f"blk.{b}.attn_k.weight": f"{p}.self_attn.k_proj.weight",
+                    f"blk.{b}.attn_v.weight": f"{p}.self_attn.v_proj.weight",
+                    f"blk.{b}.attn_output.weight": f"{p}.self_attn.o_proj.weight",
+                    f"blk.{b}.attn_q_norm.weight": f"{p}.self_attn.q_norm.weight",
+                    f"blk.{b}.attn_k_norm.weight": f"{p}.self_attn.k_norm.weight",
+                    f"blk.{b}.post_attention_norm.weight": (
+                        f"{p}.post_attention_layernorm.weight"
+                    ),
+                    f"blk.{b}.ffn_gate_inp.weight": f"{p}.mlp.gate.weight",
+                    f"blk.{b}.ffn_gate_inp_shexp.weight": (
+                        f"{p}.mlp.shared_expert_gate.weight"
+                    ),
+                    f"blk.{b}.ffn_gate_shexp.weight": (
+                        f"{p}.mlp.shared_expert.gate_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_up_shexp.weight": (
+                        f"{p}.mlp.shared_expert.up_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_down_shexp.weight": (
+                        f"{p}.mlp.shared_expert.down_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_gate_exps.weight": (
+                        f"{p}.mlp.experts.0.gate_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_up_exps.weight": (
+                        f"{p}.mlp.experts.0.up_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_down_exps.weight": (
+                        f"{p}.mlp.experts.0.down_proj.weight"
+                    ),
+                    # MTP-specific projections (the "nextn" head).
+                    f"blk.{b}.nextn.eh_proj.weight": "mtp.fc.weight",
+                    f"blk.{b}.nextn.enorm.weight": (
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    f"blk.{b}.nextn.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
+                    f"blk.{b}.nextn.shared_head_norm.weight": "mtp.norm.weight",
+                })
+            # Shared input embedding + (untied) output head.
+            gguf_to_hf_name_map["token_embd.weight"] = "mtp.embed_tokens.weight"
+            gguf_to_hf_name_map["output.weight"] = "lm_head.weight"
+            return gguf_to_hf_name_map
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
@@ -912,7 +974,16 @@ class GGUFModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = initialize_model(vllm_config=vllm_config, prefix=prefix)
+                # Pass model_config explicitly so the architecture is resolved
+                # from THIS config, not vllm_config.model_config. They differ
+                # for a speculative draft (e.g. the Qwen3.5 MTP head loaded over
+                # the target's vllm_config): without this the draft would be
+                # built as the full target backbone, colliding on layer names.
+                model = initialize_model(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                )
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)

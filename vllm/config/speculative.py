@@ -265,13 +265,26 @@ class SpeculativeConfig:
         if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
             is_moe = hf_config.model_type == "qwen3_5_moe"
             hf_config.model_type = "qwen3_5_mtp"
+            # mtp_num_hidden_layers lives on the text config for the
+            # multimodal Qwen3.5/3.6 wrappers; fall back to it.
             n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
-            hf_config.update(
-                {
-                    "n_predict": n_predict,
-                    "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
-                }
-            )
+            if n_predict is None:
+                n_predict = getattr(
+                    hf_config.get_text_config(), "mtp_num_hidden_layers", None
+                )
+            update = {
+                "n_predict": n_predict,
+                "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
+            }
+            # The text GGUF carries no vision tensors. config.py only nulls
+            # vision_config on the GGUF-read path (`_is_gguf`); a spec draft
+            # resolves its config from the HF repo via --hf-config-path, so
+            # that path is skipped and vision_config survives — which makes the
+            # GGUF loader's is_multimodal check demand a non-existent mmproj
+            # file. Null it here so the MTP draft is treated as text-only.
+            if getattr(hf_config, "vision_config", None) is not None:
+                update["vision_config"] = None
+            hf_config.update(update)
 
         if hf_config.model_type == "longcat_flash":
             hf_config.model_type = "longcat_flash_mtp"
@@ -396,6 +409,12 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=SpeculativeConfig.hf_config_override,
                     config_format=self.target_model_config.config_format,
+                    # Inherit the target's --hf-config-path so a GGUF draft
+                    # (e.g. Qwen3.5-MoE MTP) resolves its config from the HF
+                    # repo instead of re-reading the GGUF — transformers' GGUF
+                    # reader rejects archs like "qwen35moe", and the MTP draft
+                    # shares the target's GGUF + config anyway.
+                    hf_config_path=self.target_model_config.hf_config_path,
                 )
 
                 # Automatically detect the method
