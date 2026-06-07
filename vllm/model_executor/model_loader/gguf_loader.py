@@ -207,6 +207,82 @@ def _mistral4_kv_b_iterator(
         )
 
 
+def _qwen35moe_gdn_vhead_permute(
+    it: Generator[tuple[str, torch.Tensor], None, None],
+    hf_config,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Reorder Gated-DeltaNet VALUE heads from the GGUF (llama.cpp) layout into
+    the order vLLM's FLA fused_recurrent kernel expects.
+
+    llama.cpp pairs value-head ``i`` with key-head ``i % num_k_heads`` (a TILE
+    of the key heads). vLLM's kernel pairs value-head ``p`` with key-head
+    ``p // (HV // H)`` (REPEAT_INTERLEAVE). Loading the GGUF value-heads verbatim
+    therefore mis-pairs every linear-attn layer -> fluent-looking garbage.
+
+    Permute the ``num_v_heads`` value heads (and every per-value-head tensor +
+    out_proj's value-head input columns) into HF order
+    ``perm[h*r + j] = h + j*num_k_heads`` (r = HV//H) so that contiguous tensor-
+    parallel sharding + the repeat_interleave kernel reproduce the tile mapping.
+    Done pre-shard on the full tensors; head boundaries align to Q8_0 blocks so
+    the packed-byte row/column permutes are byte-clean.
+    """
+    tc = getattr(hf_config, "text_config", hf_config)
+    nv = tc.linear_num_value_heads
+    nk = tc.linear_num_key_heads
+    hv = tc.linear_value_head_dim
+    hk = tc.linear_key_head_dim
+    r = nv // nk
+    perm = torch.tensor(
+        [h + j * nk for h in range(nk) for j in range(r)], dtype=torch.long
+    )
+    qkv_v_off = nk * hk * 2  # rows [0:2*nk*hk) are q,k; value rows follow
+
+    def perm_rows_vheads(t: torch.Tensor) -> torch.Tensor:
+        # t: [nv*hv, ...]; reshape to per-head blocks and gather by perm
+        rest = t.shape[1:]
+        return t.view(nv, hv, *rest)[perm].reshape(nv * hv, *rest).contiguous()
+
+    for name, t in it:
+        try:
+            if name.endswith("linear_attn.in_proj_qkv.qweight"):
+                # q,k rows untouched; permute the trailing value rows
+                head = t[:qkv_v_off]
+                vt = perm_rows_vheads(t[qkv_v_off:])
+                t = torch.cat([head, vt], dim=0).contiguous()
+            elif name.endswith("linear_attn.in_proj_z.qweight"):
+                t = perm_rows_vheads(t)
+            elif name.endswith("linear_attn.in_proj_a.weight") or name.endswith(
+                "linear_attn.in_proj_b.weight"
+            ):
+                t = t[perm].contiguous()  # [nv, hidden]
+            elif name.endswith("linear_attn.A_log") or name.endswith(
+                "linear_attn.dt_bias"
+            ):
+                t = t[perm].contiguous()  # [nv]
+            elif name.endswith("linear_attn.conv1d.weight"):
+                # [conv_dim, kernel]; conv_dim = 2*nk*hk (q,k) + nv*hv (v)
+                head = t[:qkv_v_off]
+                vt = perm_rows_vheads(t[qkv_v_off:])
+                t = torch.cat([head, vt], dim=0).contiguous()
+            elif name.endswith("linear_attn.out_proj.qweight"):
+                # [hidden, packed(in=nv*hv)]; value heads are the packed in-dim.
+                # head boundary (hv) is a multiple of the Q8_0 group (32), so the
+                # packed bytes split cleanly into per-head block-groups.
+                out_rows, packed = t.shape
+                assert packed % nv == 0, (packed, nv)
+                t = (
+                    t.view(out_rows, nv, packed // nv)[:, perm, :]
+                    .reshape(out_rows, packed)
+                    .contiguous()
+                )
+        except Exception as e:  # pragma: no cover - surface mapping bugs loudly
+            raise RuntimeError(
+                f"qwen35moe GDN v-head permute failed for {name} "
+                f"(shape={tuple(t.shape)}): {e}"
+            ) from e
+        yield name, t
+
+
 def _mimo2_attn_qkv_iterator(
     gguf_files: list[str],
     hf_config,
@@ -397,6 +473,68 @@ class GGUFModelLoader(BaseModelLoader):
         )
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
+        if model_type == "qwen3_5_mtp":
+            # Speculative-decoding MTP draft for Qwen3.5/3.6 GGUF. The bartowski
+            # text GGUF ships exactly one block past num_hidden_layers
+            # (qwen35moe.nextn_predict_layers=1): a full-attention + MoE decoder
+            # layer plus the nextn.* projections. transformers has no
+            # Qwen3_5MoeMTP AutoModel, so the dummy-model name map built below
+            # can't be derived — hand-map the (small, fixed) MTP tensor set and
+            # return. Names must start with "mtp." (Qwen3_5MTP.load_weights drops
+            # anything else); the model's stacked_params_mapping folds
+            # q/k/v_proj -> qkv_proj, gate/up_proj -> gate_up_proj, and merged 3D
+            # expert tensors are full-loaded by FusedMoE.weight_loader. The MTP
+            # block is full-attention (no ssm_*), so no GDN v-head permute.
+            mtp_start = text_config.num_hidden_layers
+            num_mtp = getattr(text_config, "mtp_num_hidden_layers", 1) or 1
+            for j in range(num_mtp):
+                b = mtp_start + j  # GGUF block index of MTP layer j
+                p = f"mtp.layers.{j}"
+                gguf_to_hf_name_map.update({
+                    f"blk.{b}.attn_norm.weight": f"{p}.input_layernorm.weight",
+                    f"blk.{b}.attn_q.weight": f"{p}.self_attn.q_proj.weight",
+                    f"blk.{b}.attn_k.weight": f"{p}.self_attn.k_proj.weight",
+                    f"blk.{b}.attn_v.weight": f"{p}.self_attn.v_proj.weight",
+                    f"blk.{b}.attn_output.weight": f"{p}.self_attn.o_proj.weight",
+                    f"blk.{b}.attn_q_norm.weight": f"{p}.self_attn.q_norm.weight",
+                    f"blk.{b}.attn_k_norm.weight": f"{p}.self_attn.k_norm.weight",
+                    f"blk.{b}.post_attention_norm.weight": (
+                        f"{p}.post_attention_layernorm.weight"
+                    ),
+                    f"blk.{b}.ffn_gate_inp.weight": f"{p}.mlp.gate.weight",
+                    f"blk.{b}.ffn_gate_inp_shexp.weight": (
+                        f"{p}.mlp.shared_expert_gate.weight"
+                    ),
+                    f"blk.{b}.ffn_gate_shexp.weight": (
+                        f"{p}.mlp.shared_expert.gate_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_up_shexp.weight": (
+                        f"{p}.mlp.shared_expert.up_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_down_shexp.weight": (
+                        f"{p}.mlp.shared_expert.down_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_gate_exps.weight": (
+                        f"{p}.mlp.experts.0.gate_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_up_exps.weight": (
+                        f"{p}.mlp.experts.0.up_proj.weight"
+                    ),
+                    f"blk.{b}.ffn_down_exps.weight": (
+                        f"{p}.mlp.experts.0.down_proj.weight"
+                    ),
+                    # MTP-specific projections (the "nextn" head).
+                    f"blk.{b}.nextn.eh_proj.weight": "mtp.fc.weight",
+                    f"blk.{b}.nextn.enorm.weight": (
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    f"blk.{b}.nextn.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
+                    f"blk.{b}.nextn.shared_head_norm.weight": "mtp.norm.weight",
+                })
+            # Shared input embedding + (untied) output head.
+            gguf_to_hf_name_map["token_embd.weight"] = "mtp.embed_tokens.weight"
+            gguf_to_hf_name_map["output.weight"] = "lm_head.weight"
+            return gguf_to_hf_name_map
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
@@ -447,6 +585,50 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+        if model_type in ("qwen3_5_moe", "qwen3_5"):
+            # Qwen3.5/3.6 ship as a multimodal *ForConditionalGeneration*
+            # wrapper, but the bartowski text GGUF carries only the LM backbone
+            # (gguf arch "qwen35moe"/"qwen35"). Load text-only: drop the vision
+            # path and operate on the text config. gguf-py already maps the
+            # hybrid Gated-DeltaNet / SSM tensors (in_proj_*, A_log, conv1d,
+            # ssm_norm, out_proj); we only patch the gaps below.
+            is_multimodal = False
+            config = text_config
+            if model_type == "qwen3_5_moe":
+                for idx in range(config.num_hidden_layers):
+                    # 256-expert MoE with shared experts, merged per-expert in
+                    # the GGUF (like qwen3_moe). Map merged gate/up/down to
+                    # expert 0 (FusedMoE.weight_loader full-loads ndim==3).
+                    gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                        f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                    )
+                    gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                        f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                    )
+                    gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                        f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                    )
+                    sideload_params.append(
+                        re.compile(
+                            f"model\\.layers\\.{idx}"
+                            r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                        )
+                    )
+                    # Gated-DeltaNet dt_bias and A_log are bare nn.Parameters
+                    # (no .weight/.bias suffix), so find_hf_name_in_tensor_map
+                    # can't route them through gguf-py (trailing-dot bug) and
+                    # they silently keep their init values. A_log is the SSM
+                    # decay (g = -exp(A_log)*softplus(...)) — losing it breaks
+                    # the whole recurrence. Map both explicitly.
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                        f"model.layers.{idx}.linear_attn.dt_bias"
+                    )
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
+                        f"model.layers.{idx}.linear_attn.A_log"
+                    )
+                model_type = "qwen35moe"
+            else:
+                model_type = "qwen35"
         if model_type == "mimo_v2":
             # gguf-py uses arch name "mimo2"; HF model_type is "mimo_v2".
             model_type = "mimo2"
@@ -732,8 +914,17 @@ class GGUFModelLoader(BaseModelLoader):
         if hf_config.model_type == "mimo_v2":
             yield from _mimo2_attn_qkv_iterator(shards, hf_config)
 
+        _tc = getattr(hf_config, "text_config", hf_config)
+        _gdn_permute = (
+            getattr(hf_config, "model_type", None)
+            in ("qwen3_5_moe", "qwen3_5_moe_text")
+            or getattr(_tc, "model_type", None) == "qwen3_5_moe_text"
+        )
         for shard in shards:
-            yield from gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
+            base_it = gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
+            if _gdn_permute:
+                base_it = _qwen35moe_gdn_vhead_permute(base_it, hf_config)
+            yield from base_it
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
@@ -783,7 +974,16 @@ class GGUFModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = initialize_model(vllm_config=vllm_config, prefix=prefix)
+                # Pass model_config explicitly so the architecture is resolved
+                # from THIS config, not vllm_config.model_config. They differ
+                # for a speculative draft (e.g. the Qwen3.5 MTP head loaded over
+                # the target's vllm_config): without this the draft would be
+                # built as the full target backbone, colliding on layer names.
+                model = initialize_model(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                )
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)

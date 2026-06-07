@@ -75,6 +75,7 @@ from .interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -87,6 +88,8 @@ from .qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
     _maybe_sm70_projection,
+    _Q36_DBG,
+    _q36_dbg,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -111,6 +114,12 @@ logger = init_logger(__name__)
 def _should_split_linear_attn_ba(
     quant_config: QuantizationConfig | None,
 ) -> bool:
+    # GGUF stores the Gated-DeltaNet in_proj_a / in_proj_b shards as F32 while
+    # in_proj_qkv / in_proj_z are quantized (Q8_0). A 4-way fused in_proj_qkvz
+    # would mix precisions, which MergedColumnParallelLinear rejects — so always
+    # split b/a into their own uniform-precision group for GGUF.
+    if quant_config is not None and quant_config.get_name() == "gguf":
+        return True
     # AWQ/GPTQ-style configs surface the ignore list as
     # `modules_to_not_convert`; compressed-tensors uses `ignore`.
     # Inspect both so the split also triggers for CT-quantized hybrids
@@ -147,6 +156,29 @@ class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # GGUF GOTCHA: llama.cpp's qwen35moe converter stores `ssm_a` as the
+        # decay coefficient A = -exp(A_log) (always negative), NOT the raw
+        # `A_log`. But fused_gdn_gating computes g = -exp(A_log)*softplus(...),
+        # i.e. it re-applies -exp(). Loading ssm_a verbatim double-exponentiates
+        # (e.g. real A=-72 -> -exp(-72)~=0), inverting the GDN decay dynamics in
+        # every linear-attn layer -> fluent-looking garbage. Recover the raw
+        # A_log = log(-ssm_a) at load so -exp(A_log) == ssm_a == A.
+        quant_config = getattr(self, "quant_config", None)
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            from vllm.model_executor.model_loader.weight_utils import (
+                sharded_weight_loader,
+            )
+            base_loader = sharded_weight_loader(0)
+
+            def _alog_log_neg_loader(param, loaded_weight):
+                lw = torch.log(torch.clamp(-loaded_weight.float(), min=1e-30))
+                base_loader(param, lw.to(loaded_weight.dtype))
+
+            # A_log already has a weight_loader from the base __init__; replace it.
+            self.A_log.weight_loader = _alog_log_neg_loader
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -257,6 +289,13 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             device=hidden_states.device,
         )
 
+        _dbg = _Q36_DBG and self.prefix.endswith("layers.0.linear_attn")
+        if _dbg:
+            _q36_dbg("GDN.mixed_qkv", mixed_qkv)
+            _q36_dbg("GDN.b", b)
+            _q36_dbg("GDN.a", a)
+            _q36_dbg("GDN.core_in(zeros)", core_attn_out)
+
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,
             b,
@@ -264,6 +303,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             core_attn_out,
             self.prefix,
         )
+
+        if _dbg:
+            _q36_dbg("GDN.core_out", core_attn_out)
 
         # ============================================================
         # Part 3: Output Projection
@@ -391,12 +433,15 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -460,12 +505,60 @@ class Qwen3_5Model(Qwen3NextModel):
                 ("in_proj_qkvz", "in_proj_b", 4),
                 ("in_proj_qkvz", "in_proj_a", 5),
             ])
+        is_gguf = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "gguf"
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
             if name.startswith("mtp."):
                 continue
+
+            # Weight-dump probe (VLLM_QWEN36_DBG=1): fingerprint what vLLM is
+            # about to load into each layer-0 GDN param + a router gate, to diff
+            # against the raw GGUF tensors and catch transpose/order/wrong-tensor
+            # loading bugs.
+            if _Q36_DBG and (
+                "layers.0.linear_attn." in name
+                or name.endswith("layers.1.mlp.gate.weight")
+                or "layers.1.mlp.experts.0.gate_proj" in name
+                or "layers.1.mlp.experts.0.down_proj" in name
+                or "layers.1.mlp.shared_expert.gate_proj" in name
+            ):
+                import sys as _sys
+
+                _lw = loaded_weight.detach().float()
+                _fl = _lw.flatten()
+                _n = _fl.numel()
+                _fp = (
+                    f"shape={tuple(loaded_weight.shape)} dt={loaded_weight.dtype} "
+                    f"mean={_lw.mean().item():.5e} std={_lw.std().item():.5e} "
+                    f"f0={_fl[0].item():.5e}"
+                )
+                if _n >= 2:
+                    _fp += f" f1={_fl[1].item():.5e} flast={_fl[-1].item():.5e}"
+                if _lw.dim() >= 2:
+                    _fp += (
+                        f" row0sum={_lw[0].sum().item():.5e} "
+                        f"col0sum={_lw[..., 0].sum().item():.5e}"
+                    )
+                print(f"[WDUMP] {name} {_fp}", file=_sys.stderr, flush=True)
+
+            # Qwen3.5/3.6 use Gemma-style RMSNorm: y = (1 + weight) * x. During
+            # GGUF conversion llama.cpp bakes the +1 into the stored weights and
+            # applies a plain weight*x norm, so the GGUF norm weights are ~1.0.
+            # vLLM re-applies (1 + weight), double-counting the +1 and doubling
+            # every norm -> garbage output. Revert the +1 here. The GDN gated
+            # norm (linear_attn.norm) uses a plain weight*x norm (init ones), so
+            # it must NOT be adjusted.
+            if (
+                is_gguf
+                and name.endswith("norm.weight")
+                and not name.endswith("linear_attn.norm.weight")
+            ):
+                loaded_weight = loaded_weight - 1
 
             # Remapping the name of FP8 kv-scale.
             if name.endswith("scale"):
@@ -496,7 +589,21 @@ class Qwen3_5Model(Qwen3NextModel):
                     # last sub-id wins. Otherwise proceed with the
                     # output-axis split.
                     if not hasattr(param, "output_dim"):
-                        default_weight_loader(param, loaded_weight)
+                        # GGUF fused layers carry a per-shard `qweight_type`
+                        # vector (one int per output shard). The qkv sub-tensor
+                        # contributes a single scalar quant-type spanning several
+                        # shards (shard_id is a tuple). Route each slot through
+                        # the param's GGUF weight_loader so it sets BOTH
+                        # param.data[i] AND the shard_weight_type[i] dict that
+                        # apply() reads at runtime — a raw param.data write skips
+                        # that dict and KeyErrors on the first forward. Non-GGUF
+                        # metadata (e.g. compressed-tensors `weight_shape`) keeps
+                        # the default last-wins load.
+                        if getattr(param, "is_gguf_weight_type", False):
+                            for sub_id in shard_id:
+                                weight_loader(param, loaded_weight, sub_id)
+                        else:
+                            default_weight_loader(param, loaded_weight)
                         loaded_params.add(name)
                         break
                     # Split by the target module's output shard metadata
@@ -662,8 +769,58 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # Depthwise GDN conv1d: GGUF stores [C, K] but the param and
+                    # the mamba shard-loader expect [C, 1, K]. This param is a
+                    # lazy GGUFUninitializedParameter (shape unreadable), so key
+                    # the reshape off the name rather than param.shape.
+                    if "conv1d" in name and loaded_weight.dim() == 2:
+                        loaded_weight = loaded_weight.unsqueeze(1)
+                    # GGUF (ggml) drops singleton dims: shared_expert_gate is
+                    # stored [hidden] vs param [1, hidden]. Re-insert the
+                    # singleton at whichever dim the param carries one, so the
+                    # weight loader's shape check passes. Shape access on a lazy
+                    # GGUFUninitializedParameter raises ValueError — those are
+                    # GGUF-quant params that don't need this reshape, so skip.
+                    try:
+                        if param.dim() == loaded_weight.dim() + 1:
+                            for i, s in enumerate(param.shape):
+                                if s == 1 and (
+                                    tuple(param.shape[:i] + param.shape[i + 1:])
+                                    == tuple(loaded_weight.shape)
+                                ):
+                                    loaded_weight = loaded_weight.unsqueeze(i)
+                                    break
+                    except ValueError:
+                        pass
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if _Q36_DBG:
+            import sys as _sys
+
+            for _pn, _p in self.named_parameters():
+                if not any(f".layers.{i}." in _pn for i in (0, 1, 3)):
+                    continue
+                if _p.dtype in (
+                    torch.int8,
+                    torch.uint8,
+                    torch.int16,
+                    torch.int32,
+                    torch.int64,
+                ):
+                    continue  # GGUF qweight / qweight_type storage, skip
+                _pf = _p.detach().float()
+                _amax = _pf.abs().max().item()
+                _std = _pf.std().item() if _p.numel() > 1 else 0.0
+                # garbage-init signatures: absurd magnitude, all-zero, all-equal
+                if _amax > 50 or _amax == 0.0 or (_p.numel() > 1 and _std == 0.0):
+                    print(
+                        f"[SUSPECT] {_pn} shape={tuple(_p.shape)} "
+                        f"absmax={_amax:.3e} std={_std:.3e} "
+                        f"mean={_pf.mean().item():.3e}",
+                        file=_sys.stderr,
+                        flush=True,
+                    )
         return loaded_params
 
     def forward(
@@ -702,7 +859,9 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -752,6 +911,7 @@ class Qwen3_5ForCausalLMBase(
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
@@ -783,7 +943,21 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if _Q36_DBG:
+            _q36_dbg("final_hidden", hidden_states)
+            if logits is not None:
+                _q36_dbg("logits", logits)
+                import sys
+
+                top = logits[-1].float().topk(5)
+                print(
+                    f"[Q36DBG] top5_ids={top.indices.tolist()} "
+                    f"vals={[round(v, 3) for v in top.values.tolist()]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return logits
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
@@ -794,6 +968,65 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=["mtp."],
         )
         return loader.load_weights(weights)
+
+    # IsHybrid hooks — the text-only backbone is just as hybrid (GDN + full
+    # attention) as the multimodal wrapper. Without these (and the IsHybrid
+    # base), model_config.is_hybrid is False and vLLM skips the mamba/attention
+    # KV-cache page-size unification, raising NotImplementedError at startup.
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        # Qwen3.5/3.6 use interleaved M-RoPE; we MUST go through the trained
+        # MRotaryEmbedding (stripping mrope_section to plain RoPE silently
+        # corrupts every full-attention layer). The text GGUF has no image/
+        # video tokens, so the three (T/H/W) position rows are all just the
+        # sequential text position, and the decode delta is 0.
+        n = len(input_tokens)
+        positions = (
+            torch.arange(n, dtype=torch.long).unsqueeze(0).expand(3, -1).clone()
+        )
+        return positions, 0
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

@@ -81,6 +81,8 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.embed_tokens",
         )
 
         self.fc = ColumnParallelLinear(
@@ -329,6 +331,24 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # GGUF (ggml) drops singleton dims: the MTP block's
+                    # shared_expert_gate is stored [hidden] vs the param's
+                    # [1, hidden]. Re-insert the singleton at whichever dim the
+                    # param carries one so the weight loader's shape check
+                    # passes (mirrors the main Qwen3_5Model loader). Shape
+                    # access on a lazy GGUFUninitializedParameter raises
+                    # ValueError — those are Q8 params that don't need this.
+                    try:
+                        if param.dim() == loaded_weight.dim() + 1:
+                            for i, s in enumerate(param.shape):
+                                if s == 1 and (
+                                    tuple(param.shape[:i] + param.shape[i + 1:])
+                                    == tuple(loaded_weight.shape)
+                                ):
+                                    loaded_weight = loaded_weight.unsqueeze(i)
+                                    break
+                    except ValueError:
+                        pass
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         if os.getenv("VLLM_DEBUG_MTP_LOAD") == "1":
@@ -441,6 +461,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
@@ -522,8 +543,20 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                     continue
                 yield name, weight
 
+        remapped = list(remap_weight_names(weights))
+        # A GGUF weights iterator yields two passes — every ``qweight_type``
+        # first, then every ``qweight``/data tensor — ordered by GGUF tensor,
+        # not grouped by module. AutoWeightsLoader routes to submodules with
+        # itertools.groupby, which only groups CONSECUTIVE same-prefix items, so
+        # the interleaved ``model.*`` stream fragments and the MTP predictor's
+        # load_weights receives only the first run (the types), silently
+        # dropping all qweight data + F32 norms. Stable-sort by top-level module
+        # name to make each module's weights contiguous; list.sort is stable so
+        # the type-before-data order GGUF loading depends on is preserved.
+        remapped.sort(key=lambda nw: nw[0].split(".", 1)[0])
+
         loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(remapped)
         if os.getenv("VLLM_DEBUG_MTP_LOAD") == "1":
             logger.warning(
                 "Qwen3_5MTP loaded %d tensors across module params",

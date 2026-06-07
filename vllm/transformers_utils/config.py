@@ -659,6 +659,30 @@ def get_config(
         # set architectures explicitly so the GGUF text-only path resolves.
         if config.model_type == "mistral4":
             config.update({"architectures": ["Mistral4ForCausalLM"]})
+        elif config.model_type in {"qwen3_5", "qwen3_5_moe"}:
+            # Qwen3.5/3.6 ship as multimodal *ForConditionalGeneration*, but the
+            # text GGUF carries no vision tensors. Bind to the text-only backbone
+            # (vLLM extracts hf_text_config from the wrapper config). Only force
+            # this when the config still points at the multimodal wrapper, so an
+            # explicit user `architectures` override is respected.
+            text_arch = (
+                "Qwen3_5MoeForCausalLM"
+                if config.model_type == "qwen3_5_moe"
+                else "Qwen3_5ForCausalLM"
+            )
+            multimodal_wrapper = text_arch.replace(
+                "ForCausalLM", "ForConditionalGeneration"
+            )
+            if not config.architectures or config.architectures == [
+                multimodal_wrapper
+            ]:
+                config.update({"architectures": [text_arch]})
+                # The text GGUF has no vision tensors. Drop vision_config so
+                # every downstream `is_multimodal` check (GGUF loader weight
+                # map + weight-type map, mm processor) uniformly treats this
+                # as a text-only model and doesn't demand an mmproj file.
+                if getattr(config, "vision_config", None) is not None:
+                    config.update({"vision_config": None})
         elif config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         else:

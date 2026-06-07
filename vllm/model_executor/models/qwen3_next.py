@@ -26,6 +26,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -101,6 +102,36 @@ from .utils import (
 logger = init_logger(__name__)
 QWEN3_NEXT_SM70_TRACE = os.getenv("VLLM_QWEN3_NEXT_SM70_TRACE", "0") == "1"
 _QWEN3_NEXT_SM70_SEEN: set[tuple[str, int, int, int]] = set()
+
+# SM70 (V100) fp16 MoE AllReduce overflow mitigation. On fp16, summing the
+# per-rank MoE outputs across TP ranks can saturate to ±Inf, which becomes NaN
+# logits downstream and garbage tokens. Mirror the proven minimax_m2 fix: do
+# the reduce in fp32, then clamp-then-nan_to_num before casting back to fp16.
+# "safe" (default) applies it to every MoE layer; "none" restores the vanilla
+# fp16 reduce. Env: VLLM_ALLREDUCE_OVERFLOW_STRATEGY.
+_QWEN3_NEXT_AR_STRATEGY: str = os.environ.get(
+    "VLLM_ALLREDUCE_OVERFLOW_STRATEGY", "safe"
+)
+
+# Activation-bisect probe (VLLM_QWEN36_DBG=1): print per-layer tensor stats to
+# stderr for the first few layers, to localize a weight-layout bug.
+_Q36_DBG: bool = os.environ.get("VLLM_QWEN36_DBG") == "1"
+
+
+def _q36_dbg(tag: str, t: torch.Tensor) -> None:
+    import sys
+
+    try:
+        f = t.detach().float()
+        print(
+            f"[Q36DBG] {tag} shape={tuple(t.shape)} "
+            f"absmax={f.abs().max().item():.4e} mean={f.mean().item():.4e} "
+            f"nan={int(f.isnan().sum())} inf={int(f.isinf().sum())}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[Q36DBG] {tag} ERR {e}", file=sys.stderr, flush=True)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -257,9 +288,26 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
-                final_hidden_states
-            )
+            if _QWEN3_NEXT_AR_STRATEGY == "none":
+                final_hidden_states = (
+                    self.experts.maybe_all_reduce_tensor_model_parallel(
+                        final_hidden_states
+                    )
+                )
+            else:
+                # SM70 fp16 AllReduce overflow mitigation (see minimax_m2):
+                # reduce in fp32, then clamp-then-nan_to_num before the cast
+                # back to fp16. nan_to_num alone misses large-but-finite fp32
+                # sums that only overflow on the fp16 cast, so clamp first.
+                ar_dtype = final_hidden_states.dtype
+                fp32 = final_hidden_states.to(torch.float32)
+                fp32 = tensor_model_parallel_all_reduce(fp32)
+                finfo = torch.finfo(ar_dtype)
+                fp32 = torch.clamp(fp32, min=finfo.min, max=finfo.max)
+                fp32 = torch.nan_to_num(
+                    fp32, nan=0.0, posinf=finfo.max, neginf=finfo.min
+                )
+                final_hidden_states = fp32.to(ar_dtype)
 
         return final_hidden_states.view(orig_shape)
 
@@ -597,6 +645,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
+        _fcdbg = _Q36_DBG and self.prefix.endswith("layers.0.linear_attn")
+        if _fcdbg:
+            import sys
+
+            print(
+                f"[Q36DBG] _fc meta={'None' if attn_metadata is None else 'dict'}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         if attn_metadata is None:
             # V1 profile run
             return
@@ -604,6 +662,17 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if _fcdbg:
+            import sys
+
+            print(
+                f"[Q36DBG] _fc tokens={attn_metadata.num_actual_tokens} "
+                f"prefills={attn_metadata.num_prefills} "
+                f"decodes={attn_metadata.num_decodes} "
+                f"spec={attn_metadata.spec_sequence_masks is not None}",
+                file=sys.stderr,
+                flush=True,
+            )
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -1046,6 +1115,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        if _Q36_DBG and self.layer_idx < 3:
+            _q36_dbg(f"L{self.layer_idx}.{self.layer_type}.in", hidden_states)
+
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
             self.linear_attn(
@@ -1062,6 +1134,9 @@ class Qwen3NextDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
 
+        if _Q36_DBG and self.layer_idx < 3:
+            _q36_dbg(f"L{self.layer_idx}.attn_out", hidden_states)
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * self._attn_scale_p1
@@ -1072,6 +1147,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states)
+
+        if _Q36_DBG and self.layer_idx < 3:
+            _q36_dbg(f"L{self.layer_idx}.mlp_out", hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
