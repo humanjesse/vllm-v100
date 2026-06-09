@@ -14,6 +14,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 - **Mistral-Small-4 119B GGUF on V100** -- runnable model class for Bartowski's Q4_K_M GGUF of Mistral-Small-4-119B-2603 (MoE, MLA, fused `ffn_gate_up_exps` + split `attn_k_b`/`attn_v_b` tensor layouts). Ships with three latent fixes that affect any GGUF or MLA user on V100: a 4-site fp16 overflow clamp in the GGUF csrc kernels (kept kernels' internal fp32 accumulator, clamped to ±65504 at the implicit fp32→fp16 write-back), an MMQ kernel alignment dispatch in `gguf.py` (small dense models like Qwen2.5-0.5B with hidden=896 now correctly fall back to dequantize instead of reading past the qweight buffer), and a manual fp32 LSE-returning fallback in `mla_attention.py` so MLA models with prefix caching / chunked prefill no longer crash `merge_attn_states` on V100.
 - **MiMo-V2.5 310B GGUF on V100** -- runnable model class for Bartowski's Q3_K_M GGUF of XiaomiMiMo/MiMo-V2.5 (310B / 15B active, hybrid SWA + full attention with asymmetric head dims Q/K=192 / V=128, fused `attn_qkv` + 3D `ffn_*_exps` tensor layouts, MTP blocks that we skip). Ships with two additional fixes that affect any V100 user, not just MiMo: an HDIM=192 template instantiation in the `flash_attn_v100` kernels (was only 64/80/96/112/128/256 before -- any model with head_dim=192 hit the default-case TORCH_CHECK), and an MMQ alignment guard mirrored from the dense path into `_fused_moe_gguf` (MoE models with K-quant experts whose per-rank `w2-input` isn't aligned silently IMA-crashed once batch crossed the MMVQ→MMQ threshold). Also pins `triton==3.5.1` in `requirements/cuda.txt` to match torch 2.9.1+cu128's wheel metadata, since triton 3.6.0's MLA decode codegen is ~3× slower on V100 sm_70 at long context (verified on Mistral4 T2 stress: 23.5 → 9.4 tok/s with 3.6.0, restored with the pin).
 - **Qwen3.6-35B-A3B GGUF on V100** -- runnable model class for Bartowski's Q8_0 GGUF of Qwen3.6-35B-A3B (35B / 3B active, 256-expert MoE, hybrid Gated-DeltaNet + full-attention every 4th layer, interleaved M-RoPE; text backbone `Qwen3_5MoeForCausalLM`). transformers/vLLM have no GGUF support for arch `qwen35moe`, so the loader binds the text backbone via `--hf-config-path` + `--hf-overrides` (strip `vision_config`). Three GGUF-interpretation fixes were needed, each affecting any GGUF user of this arch: (a) **Gemma-style RMSNorm double-`+1`** -- Qwen3.5/3.6 use `y=(1+w)*x` and llama.cpp bakes the `+1` into the GGUF norm weights, so vLLM re-adding it doubled every norm (the loader subtracts 1 at load, excluding the gated `linear_attn.norm`); (b) **Gated-DeltaNet `A_log` double-exponentiation** -- GGUF `ssm_a` already stores the decay `A=-exp(A_log)`, so the loader stores `log(-ssm_a)` to keep `-exp(A_log)==ssm_a` instead of re-applying `-exp()` (which collapsed the recurrence in all 30 GDN layers); (c) **GDN value-head TILE vs repeat_interleave order** -- llama.cpp pairs value-head `i` with key-head `i % num_k`, vLLM's FLA kernel uses `i // r`, so the loader permutes the value heads pre-shard (head boundaries align to Q8_0 blocks, so the packed-byte permute stays byte-clean and TP-safe). A follow-on loads the model's native MTP (`nextn`) head from GGUF block 40 as a speculative-decode draft (~60% acceptance) -- it's loadable but **not recommended on V100**: spec-decode is net-negative single-stream here because the fast `flash_attn_v100` backend can't keep CUDA graphs under spec-decode (forced to PIECEWISE -> ~46 tok/s) and the `triton_attn` backend that can keep them still loses to no-spec (~77 vs ~100 tok/s) once the draft + 2-token verify overhead is counted. The same draft-loader path would pay off on Ampere/Hopper.
+- **Qwen3.5-122B-A10B GGUF on V100** -- runnable model class for Bartowski's Q6_K_L GGUF of Qwen3.5-122B-A10B (122B / 10B active, 256-expert MoE, same hybrid Gated-DeltaNet + full-attention `qwen3_5_moe` arch as the 35B above, but 48 layers and wider/narrower heads: GDN 64 value / 16 key, full-attention 32 query / **2 KV** heads / head_dim 256). Rides on the merged 35B loader fixes, but the bigger Q6_K_L quant + 8-GPU sharding exposed two more loader bugs, each affecting any GGUF user of this arch with a K-quant GDN `out_proj` or at TP > `num_kv_heads`: (a) **Q6_K GDN `out_proj` value-head column permute corrupts super-blocks** -- the value-head reorder acts on the packed input (column) dim, which is byte-clean for Q8_0 (head_dim = 4 whole 32-elem blocks) but Q6_K's 256-elem super-blocks span two value heads, so a per-head column permute splits super-blocks -> corrupt scales -> Inf weights -> NaN logits ("!!!!" garbage). The loader now dequantizes `out_proj` (reference-correct gguf-py), permutes the value-head columns in float, and emits it as an unquantized F16 weight (~1.8 GiB extra total, uniform across quants -- the previously-merged Q8_0 35B re-verified coherent on this path); (b) **full-attention KV-head replication for TP > `num_kv_heads`** -- with only 2 KV heads but TP=4/8, `QKVParallelLinear` replicates each KV head across `tp // nkv` ranks, but the GGUF weight-loader divides k/v rows naively by TP with no replication, so the qkv output width stops matching the forward split (`[q, k, v]`) and the model crashes. The loader pre-replicates the GGUF `k_proj`/`v_proj` rows by `repeat_interleave(tp // nkv)` so contiguous TP sharding reproduces the expected per-rank head layout (mirrors the MiMo fused-qkv KV replication). Both fixes are config-driven, so they no-op when not needed (e.g. the 35B at TP=2, where `nkv == tp`).
 
 ## Verified models
 
@@ -26,10 +27,11 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | [bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF) (Q4_K_M) | 119B | GGUF Q4_K_M | MoE + MLA (`Mistral4ForCausalLM`) | 8 | Working (cudagraph; ~82 tok/s short prompt, ~24 tok/s @ 6k-tok prompt, ~26 tok/s prefix-cache replay) |
 | [bartowski/MiMo-V2.5-GGUF](https://huggingface.co/bartowski/MiMo-V2.5-GGUF) (Q3_K_M) | 310B (15B active) | GGUF Q3_K_M | MoE + hybrid SWA + asymmetric head_dim (`MiMoV2FlashForCausalLM`) | 8 | Working (cudagraph; ~42 tok/s single-stream, ~64 tok/s aggregate batch=8) |
 | [bartowski/Qwen_Qwen3.6-35B-A3B-GGUF](https://huggingface.co/bartowski/Qwen_Qwen3.6-35B-A3B-GGUF) (Q8_0) | 35B (3B active) | GGUF Q8_0 | MoE (256 experts) + hybrid Gated-DeltaNet (`Qwen3_5MoeForCausalLM`) | 2 | Working (cudagraph; ~100 tok/s single-stream, ~1900 tok/s aggregate 4×TP2) |
+| [bartowski/Qwen_Qwen3.5-122B-A10B-GGUF](https://huggingface.co/bartowski/Qwen_Qwen3.5-122B-A10B-GGUF) (Q6_K_L) | 122B (10B active) | GGUF Q6_K_L | MoE (256 experts) + hybrid Gated-DeltaNet (`Qwen3_5MoeForCausalLM`) | 8 (PP2×TP4) | Working (cudagraph; coherent greedy + chat -- throughput not yet benched) |
 
 ## Hardware tested
 
-- 8x Tesla V100 SXM2 32GB (TP=8, no expert parallel)
+- 8x Tesla V100 SXM2 32GB (TP=8, or PP=2×TP=4 across the two 4-GPU NVLink islands; no expert parallel)
 
 ## Known issues
 
@@ -287,6 +289,47 @@ docker run --rm --gpus '"device=0,1"' --ipc=host \
   -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
   -p 8000:8000 \
   vllm-v100:latest \
+  --mamba-cache-mode align
+```
+
+### Quick run (Qwen3.5-122B-A10B Q6_K_L GGUF on 8x V100 32GB)
+
+Bartowski's Q6_K_L GGUF for `Qwen/Qwen3.5-122B-A10B` (3 split shards, ~102 GiB;
+`VLLM_MODEL` points at the first, the loader globs the siblings). Same
+`qwen3_5_moe` hybrid Gated-DeltaNet arch as the 35B, so the launch flags match
+(`--hf-config-path` + `--hf-overrides` bind the text backbone
+`Qwen3_5MoeForCausalLM` and null `vision_config`; `--mamba-cache-mode align`).
+Two differences from the 35B route through the loader automatically: the Q6_K_L
+quant uses the GDN `out_proj` dequant-to-F16 path, and the 2-KV-head
+full-attention layers use the KV-head replication path (both described above).
+On this 8x V100 SXM2 node NVLink forms two 4-GPU islands (0-3, 4-7), so **PP=2 ×
+TP=4 keeps every tensor-parallel all-reduce inside an island and runs faster
+than TP=8** (which crosses the slower inter-island link on every all-reduce) --
+pass `--pipeline-parallel-size 2` as a trailing arg and set
+`VLLM_TENSOR_PARALLEL_SIZE=4`. ~18 GiB/GPU weights, large KV headroom. Cudagraph
+capture engages -- do **not** add `--enforce-eager`. (The env-var block below is
+the Docker translation of the verified bare-metal `vllm serve` config; pass
+`--tensor-parallel-size 8` with no `--pipeline-parallel-size` for the single-TP
+fallback.)
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-122B-A10B-GGUF/Qwen_Qwen3.5-122B-A10B-Q6_K_L/Qwen_Qwen3.5-122B-A10B-Q6_K_L-00001-of-00003.gguf \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-122B-A10B \
+  -e VLLM_QUANTIZATION=gguf \
+  -e VLLM_DTYPE=float16 \
+  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=8192 \
+  -e VLLM_TOKENIZER=Qwen/Qwen3.5-122B-A10B \
+  -e VLLM_HF_CONFIG_PATH=Qwen/Qwen3.5-122B-A10B \
+  -e VLLM_HF_OVERRIDES='{"architectures":["Qwen3_5MoeForCausalLM"],"vision_config":null}' \
+  -e VLLM_TRUST_REMOTE_CODE=1 \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
+  -p 8000:8000 \
+  vllm-v100:latest \
+  --pipeline-parallel-size 2 \
   --mamba-cache-mode align
 ```
 

@@ -42,3 +42,14 @@ __all__ = [
     "to_enc_dec_tuple_list",
     "zip_enc_dec_prompts",
 ]
+
+# Forward-compat re-export: newer vLLM (and ai-dynamo's vLLM worker) import
+# ``MultiModalUUIDDict`` from ``vllm.inputs``; this base only exposes it under
+# ``vllm.multimodal.inputs``. Re-export it here (additive, no behavior change).
+try:
+    from vllm.multimodal.inputs import MultiModalUUIDDict  # noqa: E402
+except Exception:  # pragma: no cover - extreme import-order fallback
+    from typing import Any
+
+    MultiModalUUIDDict = dict[str, Any]  # type: ignore[misc]
+__all__.append("MultiModalUUIDDict")

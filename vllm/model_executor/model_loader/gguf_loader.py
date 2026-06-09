@@ -242,8 +242,24 @@ def _qwen35moe_gdn_vhead_permute(
         rest = t.shape[1:]
         return t.view(nv, hv, *rest)[perm].reshape(nv * hv, *rest).contiguous()
 
+    # out_proj value-head permute acts on the PACKED INPUT (column) dim. That is
+    # byte-clean only for Q8_0 (head_dim 128 = 4 whole 32-elem blocks), but Q6_K
+    # uses 256-elem super-blocks that span 2 value-heads, so a per-head column
+    # permute splits super-blocks -> corrupt scales -> Inf. So for out_proj we
+    # dequantize (gguf-py, reference-correct), permute columns in float, and emit
+    # the result as an UNQUANTIZED F16 weight (apply() then does x @ w.T). The
+    # qweight_type for out_proj is overridden to F16 accordingly. Done for every
+    # quant (uniform path); the ~36 dequantized GDN out_proj add ~1.8 GiB total.
+    _f16_id = int(gguf.GGMLQuantizationType.F16)
+    _outproj_orig_type: dict[str, int] = {}
+
     for name, t in it:
         try:
+            if name.endswith("linear_attn.out_proj.qweight_type"):
+                qwname = name[: -len("_type")]  # ...out_proj.qweight
+                _outproj_orig_type[qwname] = int(t.reshape(-1)[0].item())
+                yield name, torch.full_like(t, _f16_id)
+                continue
             if name.endswith("linear_attn.in_proj_qkv.qweight"):
                 # q,k rows untouched; permute the trailing value rows
                 head = t[:qkv_v_off]
@@ -265,21 +281,91 @@ def _qwen35moe_gdn_vhead_permute(
                 vt = perm_rows_vheads(t[qkv_v_off:])
                 t = torch.cat([head, vt], dim=0).contiguous()
             elif name.endswith("linear_attn.out_proj.qweight"):
-                # [hidden, packed(in=nv*hv)]; value heads are the packed in-dim.
-                # head boundary (hv) is a multiple of the Q8_0 group (32), so the
-                # packed bytes split cleanly into per-head block-groups.
-                out_rows, packed = t.shape
-                assert packed % nv == 0, (packed, nv)
+                # value heads are the packed INPUT dim. Byte-permuting columns
+                # corrupts Q6_K super-blocks (see note above), so dequantize ->
+                # permute value-head column-groups in float -> emit F16.
+                orig = _outproj_orig_type.get(name)
+                if orig is None:
+                    raise RuntimeError(
+                        f"out_proj {name}: missing qweight_type (expected it "
+                        "to stream before qweight)"
+                    )
+                deq = gguf.quants.dequantize(
+                    t.cpu().numpy(), gguf.GGMLQuantizationType(orig)
+                )
+                deq = torch.from_numpy(np.ascontiguousarray(deq))  # [hidden, nv*hv]
+                out_rows = deq.shape[0]
+                assert deq.shape[1] == nv * hv, (tuple(deq.shape), nv, hv)
                 t = (
-                    t.view(out_rows, nv, packed // nv)[:, perm, :]
-                    .reshape(out_rows, packed)
+                    deq.view(out_rows, nv, hv)[:, perm, :]
+                    .reshape(out_rows, nv * hv)
                     .contiguous()
+                    .to(torch.float16)
                 )
         except Exception as e:  # pragma: no cover - surface mapping bugs loudly
             raise RuntimeError(
                 f"qwen35moe GDN v-head permute failed for {name} "
                 f"(shape={tuple(t.shape)}): {e}"
             ) from e
+        yield name, t
+
+
+def _qwen35moe_attn_kv_replicate(
+    it: Generator[tuple[str, torch.Tensor], None, None],
+    hf_config,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Replicate full-attention K/V heads when num_key_value_heads < tp_size.
+
+    Qwen3.5/3.6 full-attention layers (every ``full_attention_interval``-th layer)
+    have a small ``num_key_value_heads`` (2) that can be < tensor_parallel_size
+    (e.g. 8). The non-GGUF path handles this by REPLICATING each KV head across
+    ``num_kv_head_replicas = tp_size // nkv`` ranks (QKVParallelLinear sets
+    num_kv_heads=1, replicas=tp//nkv; rank -> kv_head via tp_rank // replicas).
+    But the GGUF weight_loader for QKVParallelLinear divides the loaded k/v rows
+    naively by tp_size with NO per-head replication, so the bartowski GGUF's
+    ``nkv`` real KV heads (k_proj/v_proj = nkv*head_dim rows) get sliced into
+    fractional heads -> the qkv output width (e.g. 2176) no longer matches the
+    forward split (e.g. [2048, 256, 256] = 2560) and the model crashes.
+
+    Pre-replicate the K/V rows here (full tensor, pre-shard): repeat each KV head
+    ``replicas`` times consecutively so contiguous TP sharding reproduces the
+    rank -> (tp_rank // replicas) head layout. Head boundaries (head_dim, a
+    multiple of the Q8_0 group of 32) keep the packed-byte row repeat byte-clean.
+    Only full-attention layers expose ``self_attn.{k,v}_proj`` (GDN/linear layers
+    map to ``linear_attn.*``), so matching by name needs no layer bookkeeping.
+    Mirrors the fused-qkv K/V replication in ``_mimo2_attn_qkv_iterator``.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tc = getattr(hf_config, "text_config", hf_config)
+    tp_size = get_tensor_model_parallel_world_size()
+    nkv = tc.num_key_value_heads
+    hd = tc.head_dim or (tc.hidden_size // tc.num_attention_heads)
+    replicas = tp_size // nkv if (nkv < tp_size and nkv > 0) else 1
+
+    for name, t in it:
+        if (
+            replicas > 1
+            and (".self_attn.k_proj." in name or ".self_attn.v_proj." in name)
+            and (name.endswith(".qweight") or name.endswith(".weight"))
+        ):
+            try:
+                packed_in = t.shape[-1]
+                assert t.shape[0] == nkv * hd, (
+                    name, tuple(t.shape), nkv, hd,
+                )
+                t = (
+                    t.view(nkv, hd, packed_in)
+                    .repeat_interleave(replicas, dim=0)
+                    .contiguous()
+                    .view(nkv * replicas * hd, packed_in)
+                )
+            except Exception as e:  # pragma: no cover - surface bugs loudly
+                raise RuntimeError(
+                    f"qwen35moe attn KV replicate failed for {name} "
+                    f"(shape={tuple(t.shape)}, nkv={nkv}, hd={hd}, "
+                    f"replicas={replicas}): {e}"
+                ) from e
         yield name, t
 
 
@@ -924,6 +1010,7 @@ class GGUFModelLoader(BaseModelLoader):
             base_it = gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
             if _gdn_permute:
                 base_it = _qwen35moe_gdn_vhead_permute(base_it, hf_config)
+                base_it = _qwen35moe_attn_kv_replicate(base_it, hf_config)
             yield from base_it
 
     def download_model(self, model_config: ModelConfig) -> None:
