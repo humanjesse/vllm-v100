@@ -17,8 +17,10 @@
 #   docker build -f docker/Dockerfile.v100 --build-arg MAX_JOBS=16 ...
 
 # ---------- Builder: compile vllm + flash_attn_v100 wheels for SM70 ----------
+# Base images are pinned by digest for reproducible provenance (the tag is kept
+# for readability; the digest wins). Update the digest when bumping CUDA_VERSION.
 ARG CUDA_VERSION=12.8.1
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -38,7 +40,7 @@ ENV CUDA_HOME=/usr/local/cuda
 ARG TORCH_VERSION=2.9.1
 ARG TORCHVISION_VERSION=0.24.1
 ARG TORCHAUDIO_VERSION=2.9.1
-RUN python -m pip install --upgrade pip setuptools wheel \
+RUN python -m pip install --upgrade pip "setuptools>=77.0.3,<81.0.0" wheel \
     && python -m pip install \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
@@ -70,7 +72,7 @@ RUN python -m pip wheel ./flash-attention-v100 --no-build-isolation --no-deps -w
     && ls -la /wheels
 
 # ---------- Runtime: slim image, torch from pip (bundles cu128 libs) ----------
-FROM python:3.12-slim-trixie AS runtime
+FROM python:3.12-slim-trixie@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \

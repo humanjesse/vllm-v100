@@ -117,10 +117,12 @@ Three V100-specific flags matter here (all verified on 4x V100 SXM2):
   KV estimate is tiny (most layers are fixed-size recurrent state), so the
   default auto-trim (`1.05`) collapses the cache to ~784 tokens. Disabling the
   trim restores the full cache (~356k tokens here at `gpu-mem 0.92`).
-- **`--reasoning-parser qwen3`** -- routes `<think>...</think>` reasoning into
-  `reasoning_content`. The Qwen3.5/3.6 chat templates inject the opening
-  `<think>` into the prompt, so this fork's `qwen3` parser keys off the closing
-  `</think>` alone (issue #16); `deepseek_r1` also works.
+- **`--reasoning-parser deepseek_r1`** -- routes `<think>...</think>` reasoning
+  into `reasoning_content`. The Qwen3.5/3.6 chat templates inject the opening
+  `<think>` into the **prompt**, so the model emits only the closing `</think>`.
+  `deepseek_r1` handles this in both streaming and non-streaming. This fork's
+  `qwen3` parser is also fixed to key off the closing `</think>` (issue #16) and
+  works for **non-streaming**; use `deepseek_r1` if you stream responses.
 
 Tool-calling uses the `qwen3_coder` parser.
 
@@ -144,7 +146,7 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc=host \
   --kv-cache-auto-trim-ratio 0 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
+  --reasoning-parser deepseek_r1 \
   --default-chat-template-kwargs '{"enable_thinking":true}'
 ```
 
@@ -165,7 +167,7 @@ python -m vllm.entrypoints.openai.api_server \
   --attention-backend FLASH_ATTN_V100 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
+  --reasoning-parser deepseek_r1 \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --kv-cache-auto-trim-ratio 0
 ```
