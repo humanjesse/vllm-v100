@@ -53,12 +53,20 @@ ENV TORCH_CUDA_ARCH_LIST="7.0" \
 ARG MAX_JOBS=32
 ENV MAX_JOBS=${MAX_JOBS}
 
+# .git is not in the build context (.dockerignore), so setuptools-scm cannot
+# derive the version. Provide it explicitly; override with
+# --build-arg VLLM_VERSION_OVERRIDE=0.0.3.dev0+g<sha>.v100 to embed the commit.
+ARG VLLM_VERSION_OVERRIDE=0.0.3.dev0+v100.sm70
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
+
 WORKDIR /src
 COPY . /src
 
-# Build both wheels (no build isolation -> reuse the torch installed above).
-RUN python -m pip wheel . --no-build-isolation --no-deps -w /wheels \
-    && python -m pip wheel ./flash-attention-v100 --no-build-isolation --no-deps -w /wheels \
+# Build the wheels (no build isolation -> reuse the torch installed above).
+# Separate layers so the expensive vllm compile caches independently of the
+# quick flash_attn_v100 build.
+RUN python -m pip wheel . --no-build-isolation --no-deps -w /wheels
+RUN python -m pip wheel ./flash-attention-v100 --no-build-isolation --no-deps -w /wheels \
     && ls -la /wheels
 
 # ---------- Runtime: slim image, torch from pip (bundles cu128 libs) ----------
