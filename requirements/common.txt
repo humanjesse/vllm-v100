@@ -7,7 +7,7 @@ requests >= 2.26.0
 tqdm
 blake3
 py-cpuinfo
-transformers >= 4.56.0, < 5
+transformers >= 5.12.1, < 6  # GGUF models (mistral4, qwen3_5_moe) need 5.x model classes (Mistral4Config etc.); the old `<5` pin was a v4-era leftover from the 1Cat base and broke every new-arch GGUF on a fresh install (vllm-v100 #18). Floor is the validated known-good (5.12.1 -> mistral4 5/5, qwen36 3/3, minimax 4/4); `< 6` avoids untested future majors.
 tokenizers >= 0.21.1  # Required for fast incremental detokenization.
 protobuf # Required by LlamaTokenizer, gRPC.
 fastapi[standard] >= 0.115.0, < 0.130 # Required by FastAPI's form models in the OpenAI API server's audio transcriptions endpoint. Upper bound: fastapi >= 0.130 ships `_IncludedRouter` (no `.path`), which breaks prometheus-fastapi-instrumentator's route-name lookup on every request (vllm-v100 #16).
