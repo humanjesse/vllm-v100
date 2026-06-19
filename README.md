@@ -38,20 +38,34 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 - **Expert parallel corrupts MoE output** for MiniMax M2.7 on this fork. Use tensor parallelism without `--enable-expert-parallel`. Root cause is likely in the EP code path for 256-expert models.
 - **V100 Triton JIT compilation takes 30-90 minutes** on first request. Set `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000` to avoid pod kills.
 - **Do NOT use `--quantization gptq_marlin`** or `CUDA_LAUNCH_BLOCKING=1` on V100.
+- **Custom all-reduce is unsupported on SM70.** V100 (compute capability 7.0) has no symmetric-memory communicator (`SymmMemCommunicator: Device capability 7.0 not supported`). For multi-GPU TP, pass `--disable-custom-all-reduce` so vLLM uses the NCCL all-reduce path; this also lets cudagraph (non-eager) capture succeed, so `--enforce-eager` is usually unnecessary.
+- **`--kv-cache-auto-trim-ratio` collapses the cache for hybrid models.** The default (`1.05`) sizes the cache to `per_request_KV x max_num_seqs x 1.05`. For hybrid Gated-DeltaNet / Mamba models the per-request KV estimate is dominated by tiny fixed-size recurrent state, so the cache is trimmed to a few hundred tokens (e.g. 21.8 GiB -> 0.05 GiB / 784 tokens on Qwen3.6-27B). Pass `--kv-cache-auto-trim-ratio 0` (or `--kv-cache-memory-bytes`) to disable trimming.
+- **`qwen3_5_moe` GGUF models need `transformers >= 5`.** The Qwen3.5/3.6 GGUF rows below (35B-A3B, 122B-A10B) load via the GGUF path, which builds a dummy HF model (`AutoModelForCausalLM.from_config`) to derive the tensor-name map. Native `qwen3_5_moe` support only exists in `transformers >= 5.0`; with this repo's current `transformers < 5` pin (resolves to 4.57.x) loading fails with `Unrecognized configuration class Qwen3_5MoeTextConfig for AutoModelForCausalLM`. The AWQ/compressed-tensors Qwen3.x models are unaffected (they use vLLM's own model class, not the GGUF dummy-model path). Tracked for a follow-up (bump the pin, or register a transformers-compatible `Qwen3_5Moe` stub like the `mistral4` path does).
 
 ## Docker build
 
 Build the image from the included Dockerfile:
 
 ```bash
-docker build -f docker/Dockerfile.sm70-wheel -t vllm-v100:latest .
+docker build -f docker/Dockerfile.v100 -t vllm-v100:latest .
 ```
 
-The Docker images install three artifacts: PyTorch (cu128), 1Cat's vLLM
-wheel (v0.0.2 with our overlaid Python patches), and 1Cat's
-`flash_attn_v100` wheel (v0.0.3, cp312/cu128). The FA-V100 wheel unlocks
-`--attention-backend FLASH_ATTN_V100` (the SM70 FlashAttention-2 path).
-Without it the registered backend silently falls back to Triton.
+`Dockerfile.v100` builds this fork's own wheels from source for SM70
+(`TORCH_CUDA_ARCH_LIST=7.0`) in a builder stage, then installs them into a
+slim runtime image: PyTorch (cu128), the `vllm` wheel (vendored TurboMind
+SM70 AWQ GEMM included), and the `flash_attn_v100` wheel. Building from
+source keeps the image in lockstep with this repo's Python *and* CUDA
+patches -- the GGUF `csrc` fp16 clamps and the `flash_attn_v100` HDIM
+templates live in compiled code and cannot be delivered by copying `.py`
+files over a prebuilt wheel. The FA-V100 wheel unlocks
+`--attention-backend FLASH_ATTN_V100` (the SM70 FlashAttention-2 path);
+without it the registered backend silently falls back to Triton.
+
+> **Note:** the older `docker/Dockerfile.sm70-wheel` installed 1Cat's
+> prebuilt `v0.0.2` wheel and overlaid only a handful of patched `.py`
+> files. That overlay list drifted out of date (it was missing ~35 of the
+> 44 changed Python files, including `turbomind_asym.py`) and could not
+> ship the fork's `csrc`/kernel fixes at all. Prefer `Dockerfile.v100`.
 
 ### Building flash_attn_v100 from source
 
@@ -89,10 +103,29 @@ docker run --rm --gpus all --ipc=host \
 ### Quick run (Qwen3.6-27B-AWQ-INT4 on 4x V100 32GB)
 
 Hybrid Gated DeltaNet, asymmetric compressed-tensors W4A16. Requires the
-new `TurboMindAsymLinearKernel` for dense Linear (already in this fork).
-`--enforce-eager` is required: V100 hits an upstream `causal_conv1d`
-CUDA-graph capture assertion (vllm-project/vllm#35945) on small batches.
-Tool-calling is enabled with the `qwen3_coder` parser.
+`TurboMindAsymLinearKernel` for dense Linear (already in this fork).
+
+Three V100-specific flags matter here (all verified on 4x V100 SXM2):
+
+- **`--disable-custom-all-reduce` (not `--enforce-eager`)** -- cudagraphs
+  capture fine on this model; the real blocker is the custom/symmetric-memory
+  all-reduce, which is unsupported on SM70 (`SymmMemCommunicator: Device
+  capability 7.0 not supported`). Disable it and the non-eager path runs with
+  the `FLASH_ATTN_V100` decode kernel (CUDA-graph safe). Eager is ~3x slower
+  and is **not** needed -- the previously documented `causal_conv1d`
+  cuda-graph assertion does not reproduce once custom all-reduce is off.
+- **`--kv-cache-auto-trim-ratio 0`** -- the hybrid Gated-DeltaNet per-request
+  KV estimate is tiny (most layers are fixed-size recurrent state), so the
+  default auto-trim (`1.05`) collapses the cache to ~784 tokens. Disabling the
+  trim restores the full cache (~356k tokens here at `gpu-mem 0.92`).
+- **`--reasoning-parser deepseek_r1`** -- routes `<think>...</think>` reasoning
+  into `reasoning_content`. The Qwen3.5/3.6 chat templates inject the opening
+  `<think>` into the **prompt**, so the model emits only the closing `</think>`.
+  `deepseek_r1` handles this in both streaming and non-streaming. This fork's
+  `qwen3` parser is also fixed to key off the closing `</think>` (issue #16) and
+  works for **non-streaming**; use `deepseek_r1` if you stream responses.
+
+Tool-calling uses the `qwen3_coder` parser.
 
 ```bash
 docker run --rm --gpus '"device=0,1,2,3"' --ipc=host \
@@ -102,17 +135,42 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc=host \
   -e VLLM_QUANTIZATION=compressed-tensors \
   -e VLLM_DTYPE=float16 \
   -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.85 \
-  -e VLLM_MAX_MODEL_LEN=32768 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
-  -e VLLM_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}' \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.92 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
+  -e VLLM_MAX_NUM_SEQS=4 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=4096 \
+  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
   -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
   -p 8000:8000 \
   vllm-v100:latest \
-  --enforce-eager \
+  --disable-custom-all-reduce \
+  --kv-cache-auto-trim-ratio 0 \
   --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser deepseek_r1 \
+  --default-chat-template-kwargs '{"enable_thinking":true}'
+```
+
+The equivalent native (non-Docker) invocation, for running from a source
+checkout or a pip-installed wheel:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model cyankiwi/Qwen3.6-27B-AWQ-INT4 \
+  --served-model-name Qwen3.6-27B-AWQ-INT4 \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 4 \
+  --disable-custom-all-reduce \
+  --gpu-memory-utilization 0.92 \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 \
+  --attention-backend FLASH_ATTN_V100 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser deepseek_r1 \
+  --default-chat-template-kwargs '{"enable_thinking":true}' \
+  --kv-cache-auto-trim-ratio 0
 ```
 
 ### Quick run (granite-4.1-8b-AWQ-INT4 on 2x V100 32GB)

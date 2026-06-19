@@ -1,15 +1,78 @@
-# vllm-v100: V100 (SM70) inference image
+# vllm-v100: V100 (SM70) inference image -- built from source
 #
-# Installs 1Cat's pre-built wheel (for compiled TurboMind SM70 CUDA kernels),
-# then overlays patched Python files for compressed-tensors, MoE, and
-# TurboMindLinearKernel support.
+# Unlike docker/Dockerfile.sm70-wheel (which installs 1Cat's prebuilt v0.0.2
+# wheel and overlays a handful of patched .py files), this Dockerfile compiles
+# this fork's *own* wheels from source for SM70. That keeps the image in
+# lockstep with the repo's Python AND CUDA patches -- the vendored TurboMind
+# SM70 AWQ GEMM (csrc/quantization/awq/*sm70*, lmdeploy/src/turbomind), the
+# GGUF csrc fp16 clamps, and the flash_attn_v100 HDIM templates all live in
+# compiled code and cannot be delivered by copying .py files over a prebuilt
+# wheel.
 #
-# Build:
+# Build (context must be the repo root so the builder can see csrc/, lmdeploy/,
+# flash-attention-v100/):
 #   docker build -f docker/Dockerfile.v100 -t vllm-v100:latest .
 #
-# The build context must be the repo root so COPY can reach vllm/ source files.
+# Override the build parallelism if the builder host is memory-constrained:
+#   docker build -f docker/Dockerfile.v100 --build-arg MAX_JOBS=16 ...
 
-FROM python:3.12-slim-trixie
+# ---------- Builder: compile vllm + flash_attn_v100 wheels for SM70 ----------
+# Base images are pinned by digest for reproducible provenance (the tag is kept
+# for readability; the digest wins). Update the digest when bumping CUDA_VERSION.
+ARG CUDA_VERSION=12.8.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
+        python3-pip git ca-certificates build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Isolated venv so the wheels link against exactly this torch.
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:$PATH
+ENV CUDA_HOME=/usr/local/cuda
+
+ARG TORCH_VERSION=2.9.1
+ARG TORCHVISION_VERSION=0.24.1
+ARG TORCHAUDIO_VERSION=2.9.1
+RUN python -m pip install --upgrade pip "setuptools>=77.0.3,<81.0.0" wheel \
+    && python -m pip install \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+    && python -m pip install "cmake>=3.26,<4" ninja "setuptools-scm>=8" \
+        "packaging>=24.2" jinja2 regex grpcio-tools build
+
+# Only SM70 (V100). NVCC_THREADS x MAX_JOBS should fit the builder's RAM.
+ENV TORCH_CUDA_ARCH_LIST="7.0" \
+    VLLM_TARGET_DEVICE=cuda \
+    NVCC_THREADS=4
+ARG MAX_JOBS=32
+ENV MAX_JOBS=${MAX_JOBS}
+
+# .git is not in the build context (.dockerignore), so setuptools-scm cannot
+# derive the version. Provide it explicitly; override with
+# --build-arg VLLM_VERSION_OVERRIDE=0.0.3.dev0+g<sha>.v100 to embed the commit.
+ARG VLLM_VERSION_OVERRIDE=0.0.3.dev0+v100.sm70
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
+
+WORKDIR /src
+COPY . /src
+
+# Build the wheels (no build isolation -> reuse the torch installed above).
+# Separate layers so the expensive vllm compile caches independently of the
+# quick flash_attn_v100 build.
+RUN python -m pip wheel . --no-build-isolation --no-deps -w /wheels
+RUN python -m pip wheel ./flash-attention-v100 --no-build-isolation --no-deps -w /wheels \
+    && ls -la /wheels
+
+# ---------- Runtime: slim image, torch from pip (bundles cu128 libs) ----------
+FROM python:3.12-slim-trixie@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -19,79 +82,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash \
-        ca-certificates \
-        curl \
-        gcc \
-        g++ \
-        git \
-        libgl1 \
-        libglib2.0-0 \
-        libgomp1 \
-        tini \
+        bash ca-certificates curl libgl1 libglib2.0-0 libgomp1 tini \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TORCH_VERSION=2.9.1
 ARG TORCHVISION_VERSION=0.24.1
 ARG TORCHAUDIO_VERSION=2.9.1
-ARG VLLM_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.2/vllm-0.0.2.dev0+g55573923a.d20260321.cu128-cp312-cp312-linux_x86_64.whl"
-# Optional FlashAttention-V100 wheel. Unlocks `--attention-backend FLASH_ATTN_V100`.
-# Without it, the registered backend silently falls back to Triton.
-ARG FLASH_ATTN_V100_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.3/flash_attn_v100-26.2-cp312-cp312-linux_x86_64.whl"
-
-RUN python -m pip install --upgrade pip setuptools wheel \
+RUN python -m pip install --upgrade pip \
     && python -m pip install \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
-        torchaudio==${TORCHAUDIO_VERSION} \
-    && python -m pip install "${VLLM_WHEEL_URL}" \
-    && python -m pip install "${FLASH_ATTN_V100_WHEEL_URL}"
+        torchaudio==${TORCHAUDIO_VERSION}
 
-# ---------- Overlay patched Python files onto installed wheel ----------
-# The wheel provides compiled CUDA kernels (awq_gemm_sm70, etc.).
-# These COPY commands replace only the Python files we've patched.
-
-ARG SITE_PKG=/usr/local/lib/python3.12/site-packages/vllm
-
-# 1. compressed-tensors min_capability 75 → 70
-COPY vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py \
-     ${SITE_PKG}/model_executor/layers/quantization/compressed_tensors/schemes/
-
-# 2. Triton W4A16 kernel (PR #32597, fallback for dense layers)
-COPY vllm/model_executor/layers/quantization/gptq_triton.py \
-     ${SITE_PKG}/model_executor/layers/quantization/
-
-# 3. TritonLinearKernel wrapper
-COPY vllm/model_executor/layers/quantization/kernels/mixed_precision/triton.py \
-     ${SITE_PKG}/model_executor/layers/quantization/kernels/mixed_precision/
-
-# 4. TurboMindLinearKernel — CT→AWQ→TurboMind for dense layers (<0.1% error)
-COPY vllm/model_executor/layers/quantization/kernels/mixed_precision/turbomind.py \
-     ${SITE_PKG}/model_executor/layers/quantization/kernels/mixed_precision/
-
-# 5. Kernel registration (TurboMind priority, Triton fallback)
-COPY vllm/model_executor/layers/quantization/kernels/mixed_precision/__init__.py \
-     ${SITE_PKG}/model_executor/layers/quantization/kernels/mixed_precision/
-
-# 6. _DEFAULT_MAX_TOKENS alias fix
-COPY vllm/model_executor/layers/quantization/awq_sm70_moe.py \
-     ${SITE_PKG}/model_executor/layers/quantization/
-
-# 7. CT MoE delegates to AWQSM70MoEMethod
-COPY vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py \
-     ${SITE_PKG}/model_executor/layers/quantization/compressed_tensors/
-
-# 8. Triton SSD single-config (SM70 96KB shared memory limit)
-COPY vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py \
-     ${SITE_PKG}/model_executor/layers/mamba/ops/
-COPY vllm/model_executor/layers/mamba/ops/ssd_chunk_state.py \
-     ${SITE_PKG}/model_executor/layers/mamba/ops/
-
-# 9. Fused MoE config for NemotronH dims on V100 (E=512, N=336)
-COPY "vllm/model_executor/layers/fused_moe/configs/E=512,N=336,device_name=Tesla_V100-SXM2-32GB,dtype=int4_w4a16.json" \
-     ${SITE_PKG}/model_executor/layers/fused_moe/configs/
-
-# ------------------------------------------------------------------
+# Install the wheels we just built. vllm's runtime deps resolve from PyPI.
+COPY --from=builder /wheels /wheels
+RUN python -m pip install /wheels/vllm-*.whl \
+    && python -m pip install --no-deps /wheels/flash_attn_v100-*.whl \
+    && rm -rf /wheels
 
 COPY docker/entrypoint.sm70.sh /usr/local/bin/entrypoint.sm70.sh
 RUN chmod +x /usr/local/bin/entrypoint.sm70.sh

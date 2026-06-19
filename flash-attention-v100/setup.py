@@ -74,9 +74,18 @@ def get_cmdclass():
 
     class CustomBuildExtension(BuildExtension):
         def build_extensions(self):
+            import os
             import torch
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is required but not available.")
+            # Allow GPU-less cross-compilation (e.g. `docker build`, CI): the
+            # kernels are hardcoded to sm_70 and don't need a live GPU to
+            # compile, only nvcc + torch. Keep the guard when no arch is given.
+            if not torch.cuda.is_available() and not os.environ.get(
+                "TORCH_CUDA_ARCH_LIST"
+            ):
+                raise RuntimeError(
+                    "CUDA is required but not available. Set "
+                    "TORCH_CUDA_ARCH_LIST=7.0 to cross-compile without a GPU."
+                )
             if parse(torch.version.cuda) < parse("11.6"):
                 raise RuntimeError(
                     f"CUDA version {torch.version.cuda} < 11.6 is not supported. "

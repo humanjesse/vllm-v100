@@ -10,13 +10,13 @@ py-cpuinfo
 transformers >= 4.56.0, < 5
 tokenizers >= 0.21.1  # Required for fast incremental detokenization.
 protobuf # Required by LlamaTokenizer, gRPC.
-fastapi[standard] >= 0.115.0 # Required by FastAPI's form models in the OpenAI API server's audio transcriptions endpoint.
+fastapi[standard] >= 0.115.0, < 0.130 # Required by FastAPI's form models in the OpenAI API server's audio transcriptions endpoint. Upper bound: fastapi >= 0.130 ships `_IncludedRouter` (no `.path`), which breaks prometheus-fastapi-instrumentator's route-name lookup on every request (vllm-v100 #16).
 aiohttp >= 3.13.3
 openai >= 1.99.1  # For Responses API with reasoning content
 pydantic >= 2.12.0
 prometheus_client >= 0.18.0
 pillow  # Required for image processing
-prometheus-fastapi-instrumentator >= 7.0.0
+prometheus-fastapi-instrumentator >= 7.0.0, < 8  # 8.0.0 requires starlette >= 1.0, which conflicts with the fastapi < 0.130 pin above; 7.x works with the tested fastapi 0.12x / starlette 0.5x line.
 tiktoken >= 0.6.0  # Required for DBRX tokenizer
 lm-format-enforcer == 0.11.3
 llguidance >= 1.3.0, < 1.4.0; platform_machine == "x86_64" or platform_machine == "arm64" or platform_machine == "aarch64" or platform_machine == "s390x" or platform_machine == "ppc64le"
