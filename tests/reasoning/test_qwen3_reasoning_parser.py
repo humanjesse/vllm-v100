@@ -54,10 +54,13 @@ MULTILINE_REASONING = {
     "reasoning": "This is a reasoning\nsection",
     "content": "This is the rest\nThat",
 }
+# A generated opening <think> with no closing </think> is a truncated
+# reasoning block -> reasoning (consistent with the streaming variant below),
+# not answer content. (Plain no-think output has no tags at all.)
 ONLY_OPEN_TAG = {
     "output": "<think>This is a reasoning section",
-    "reasoning": None,
-    "content": "<think>This is a reasoning section",
+    "reasoning": "This is a reasoning section",
+    "content": None,
 }
 
 ONLY_OPEN_TAG_STREAM = {

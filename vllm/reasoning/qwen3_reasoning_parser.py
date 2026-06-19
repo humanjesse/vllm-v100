@@ -60,8 +60,14 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         Returns:
             tuple[Optional[str], Optional[str]]: reasoning content and content
         """
-        # No closing tag: thinking disabled (pure content) or not yet closed.
         if self.end_token not in model_output:
+            # No closing tag. If a leading <think> was generated, this is an
+            # unterminated (truncated) reasoning block -> reasoning, consistent
+            # with the streaming path. If there are no think tokens at all, the
+            # model emitted plain content (enable_thinking=False) -> content.
+            stripped = model_output.lstrip()
+            if stripped.startswith(self.start_token):
+                return stripped[len(self.start_token) :], None
             return None, model_output
 
         reasoning, _, content = model_output.partition(self.end_token)
