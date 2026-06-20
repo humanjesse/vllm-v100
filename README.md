@@ -40,7 +40,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 - **Do NOT use `--quantization gptq_marlin`** or `CUDA_LAUNCH_BLOCKING=1` on V100.
 - **Custom all-reduce is unsupported on SM70.** V100 (compute capability 7.0) has no symmetric-memory communicator (`SymmMemCommunicator: Device capability 7.0 not supported`). For multi-GPU TP, pass `--disable-custom-all-reduce` so vLLM uses the NCCL all-reduce path; this also lets cudagraph (non-eager) capture succeed, so `--enforce-eager` is usually unnecessary.
 - **`--kv-cache-auto-trim-ratio` collapses the cache for hybrid models.** The default (`1.05`) sizes the cache to `per_request_KV x max_num_seqs x 1.05`. For hybrid Gated-DeltaNet / Mamba models the per-request KV estimate is dominated by tiny fixed-size recurrent state, so the cache is trimmed to a few hundred tokens (e.g. 21.8 GiB -> 0.05 GiB / 784 tokens on Qwen3.6-27B). Pass `--kv-cache-auto-trim-ratio 0` (or `--kv-cache-memory-bytes`) to disable trimming.
-- **`qwen3_5_moe` GGUF models need `transformers >= 5`.** The Qwen3.5/3.6 GGUF rows below (35B-A3B, 122B-A10B) load via the GGUF path, which builds a dummy HF model (`AutoModelForCausalLM.from_config`) to derive the tensor-name map. Native `qwen3_5_moe` support only exists in `transformers >= 5.0`; with this repo's current `transformers < 5` pin (resolves to 4.57.x) loading fails with `Unrecognized configuration class Qwen3_5MoeTextConfig for AutoModelForCausalLM`. The AWQ/compressed-tensors Qwen3.x models are unaffected (they use vLLM's own model class, not the GGUF dummy-model path). Tracked for a follow-up (bump the pin, or register a transformers-compatible `Qwen3_5Moe` stub like the `mistral4` path does).
+- **GGUF models with new-arch model classes (`mistral4`, `qwen3_5_moe`) need `transformers >= 5`.** These GGUFs load via a path that builds a dummy HF model (`AutoModelForCausalLM.from_config`) to derive the tensor-name map, which needs the native `Mistral4Config` / `Qwen3_5MoeConfig` classes -- present only in `transformers >= 5.x`. On `transformers < 5` (4.57.x) loading fails (`Unrecognized configuration class Qwen3_5MoeTextConfig` / `architecture mistral4 not supported`). **Resolved:** the pin is now `transformers >= 5.12.1, < 6` (validated on 5.12.1). AWQ/compressed-tensors models are unaffected either way (own model class, no GGUF dummy-model path). Note: install this fork's prebuilt wheel **directly** (it pins transformers correctly) -- copying only the `.py` overlays onto a base wheel leaves the compiled `_C` without the SM70 GGUF/MLA csrc patches and breaks long-context MLA (`gather_and_maybe_dequant_cache only support head_dim 576`).
 
 ## Docker build
 
@@ -240,37 +240,52 @@ docker run --rm --gpus all --ipc=host \
 
 ### Quick run (Mistral-Small-4 119B Q4_K_M GGUF on 8x V100 32GB)
 
-Bartowski's GGUF for `mistralai/Mistral-Small-4-119B-2603`. `VLLM_MODEL`
-points at the first GGUF shard; `--tokenizer
-mistralai/Mistral-Small-4-119B-2603` (passed through `$@`) overrides the
-GGUF-embedded tokenizer with the HF one, which carries the official chat
-template that emits the
-`[MODEL_SETTINGS]{"reasoning_effort":"none"}[/MODEL_SETTINGS][INST]...[/INST]`
-envelope the model was trained on. Cudagraph capture engages -- do
-**not** add `--enforce-eager`. Prefix caching is supported (the LSE-SDPA
-fallback in `mla_attention.py` keeps `merge_attn_states` happy on V100).
-Local bench (TP=8, max_model_len=16384): ~82 tok/s decode on a short
-prompt, ~24 tok/s decode at 6k-token prompt + 512-token generation
-(chunked prefill on, `max_num_batched_tokens=2048`), ~26 tok/s decode on
-prefix-cache replay.
+Bartowski's GGUF for `mistralai/Mistral-Small-4-119B-2603`. **Requires
+`transformers >= 5.12.1`** (ships `Mistral4Config`/`Mistral4ForCausalLM`; the
+pin enforces it). Three flags make this launch non-trivial:
+
+- **`--hf-config-path` must point at a FLAT mistral4 text config**, not the HF
+  repo directly. transformers has no `mistral4` in its GGUF arch allowlist, so
+  config has to come from `--hf-config-path` -- but the HF repo's `config.json`
+  is the multimodal `mistral3` wrapper, which transformers 5.x loads as a
+  `pixtral` config whose nested text config mis-types to `deepseek_v3`. So build
+  a flat config dir once from the repo's *raw* `text_config` (where `model_type`
+  really is `mistral4`):
+  ```bash
+  python - <<'PY'
+  import json, os
+  from huggingface_hub import hf_hub_download
+  tc = json.load(open(hf_hub_download('mistralai/Mistral-Small-4-119B-2603','config.json')))['text_config']
+  tc['architectures'] = ['Mistral4ForCausalLM']; tc.pop('quantization_config', None)
+  d = os.path.expanduser('~/models/mistral4-hf-config'); os.makedirs(d, exist_ok=True)
+  json.dump(tc, open(f'{d}/config.json','w'), indent=2)
+  PY
+  ```
+- **Do NOT force `--attention-backend`.** Mistral4 is MLA; a forced backend
+  (e.g. the entrypoint default `TRITON_ATTN`) errors with `MLA not supported`.
+  Leave it unset so vLLM auto-selects `TRITON_MLA` (with the SM70 SDPA prefill
+  fallback). `--tokenizer mistralai/...` pulls the official chat template
+  (`[MODEL_SETTINGS]{...}[INST]...[/INST]`); the repo's weights are gated but
+  its tokenizer/config metadata is public (no token needed).
+
+Cudagraph capture engages -- do **not** add `--enforce-eager`. Prefix caching is
+supported (the LSE-SDPA fallback in `mla_attention.py` keeps `merge_attn_states`
+happy on V100). Verified via `vllm serve` on 8x V100 (TP=8, max_model_len=16384):
+~86 tok/s short-prompt decode, ~24 tok/s at 6k-token prompt + 512-token gen
+(chunked prefill, `max_num_batched_tokens=2048`), ~26 tok/s prefix-cache replay.
 
 ```bash
-docker run --rm --gpus all --ipc=host \
-  -v /path/to/models:/models:ro \
-  -e VLLM_MODEL=/models/bartowski/mistralai_Mistral-Small-4-119B-2603-Q4_K_M/mistralai_Mistral-Small-4-119B-2603-Q4_K_M-00001-of-00002.gguf \
-  -e VLLM_SERVED_MODEL_NAME=Mistral-Small-4-119B-Q4_K_M \
-  -e VLLM_QUANTIZATION=gguf \
-  -e VLLM_DTYPE=float16 \
-  -e VLLM_TENSOR_PARALLEL_SIZE=8 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.70 \
-  -e VLLM_MAX_MODEL_LEN=16384 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
-  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
-  -p 8000:8000 \
-  vllm-v100:latest \
+vllm serve /models/.../mistralai_Mistral-Small-4-119B-2603-Q4_K_M-00001-of-00002.gguf \
+  --served-model-name Mistral-Small-4-119B-Q4_K_M \
+  --hf-config-path ~/models/mistral4-hf-config \
   --tokenizer mistralai/Mistral-Small-4-119B-2603 \
-  --enable-prefix-caching
+  --quantization gguf --dtype float16 \
+  --tensor-parallel-size 8 --gpu-memory-utilization 0.70 \
+  --max-model-len 16384 --max-num-seqs 1 --max-num-batched-tokens 2048 \
+  --disable-custom-all-reduce --enable-prefix-caching \
+  --enable-auto-tool-choice --tool-call-parser mistral \
+  --host 0.0.0.0 --port 8000
+# (VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 for the slow first-request Triton JIT)
 ```
 
 ### Quick run (MiMo-V2.5 310B Q3_K_M GGUF on 8x V100 32GB)
