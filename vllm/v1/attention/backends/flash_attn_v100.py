@@ -319,6 +319,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             assert output is not None
             return output.fill_(0)
 
+        # The custom CUDA kernels only dispatch these head dimensions.
+        # Use the parent Triton implementation for all other dimensions.
+        if query.shape[-1] not in {16, 32, 64, 128, 192, 256}:
+            return super().forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+
         if not self.use_flash_v100 and not _warned_missing_flash_ops:
             logger.warning(
                 "FLASH_ATTN_V100 backend selected, but optional module "
@@ -519,5 +534,5 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        # Flash Attention V100 requires head_dim % 8 == 0.
-        return [64, 80, 96, 112, 128, 192, 256]
+        # Head dimensions implemented by the custom CUDA dispatchers.
+        return [16, 32, 64, 128, 192, 256]
